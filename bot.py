@@ -88,21 +88,12 @@ async def handler(event):
     if event.out:
         return
 
-    # Ignora mensagens salvas no próprio "me" (Saved Messages) para evitar loop do log
-    me = await client.get_me()
-    if event.chat_id == me.id:
-        return
-
-    # Ignora mensagens vindas de bots (evita loop com rjesus99_bot e outros)
+    # Ignora mensagens vindas especificamente do rjesus99_bot
     try:
         sender = await event.get_sender()
-        if getattr(sender, "bot", False):
-            return
-        # Ignora especificamente o rjesus99_bot, se necessário
         if getattr(sender, "username", "") and sender.username.lower() == "rjesus99_bot":
             return
     except Exception:
-        # Se não conseguir obter sender, continua (mas o cache ainda protege de loops)
         pass
 
     # evita repetir a mesma mensagem
