@@ -3,6 +3,7 @@ import logging
 import unicodedata
 import asyncio
 import threading
+import requests  # IMPORTANTE
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 
@@ -19,7 +20,6 @@ def read_root():
 def start_server():
     uvicorn.run(app, host="0.0.0.0", port=7860)
 
-# Inicia o servidor em paralelo (thread separada)
 threading.Thread(target=start_server, daemon=True).start()
 
 # --- Configuração do Userbot
@@ -33,11 +33,19 @@ logging.basicConfig(
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
-TERMOS = os.getenv("TERMOS").split(",")
+
+# TERMOS com strip para evitar falhas por espaços
+TERMOS_ENV = os.getenv("TERMOS", "")
+TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
 
 # Configurações de Notificação do Bot
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DESTINO_ID = os.getenv("DESTINO_ID")
+DESTINO_ID_ENV = os.getenv("DESTINO_ID", "").strip()
+try:
+    DESTINO_ID = int(DESTINO_ID_ENV)
+except ValueError:
+    # Permite usar @username, mas é menos confiável para Bot API
+    DESTINO_ID = DESTINO_ID_ENV
 
 def normalize(text):
     if not text:
@@ -47,29 +55,35 @@ def normalize(text):
     text = "".join([c for c in text if not unicodedata.combining(c)])
     return text
 
-def enviar_notificacao_push(texto):
-    if BOT_TOKEN and DESTINO_ID:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {
-            "chat_id": DESTINO_ID,
-            "text": texto,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True
-        }
-        try:
-            requests.post(url, data=data)
-        except Exception as e:
-            print(f"Erro ao enviar push: {e}")
+def enviar_notificacao_push(html_texto):
+    if not BOT_TOKEN or not DESTINO_ID:
+        print("BOT_TOKEN ou DESTINO_ID não definidos; notificações desativadas.")
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": DESTINO_ID,
+        "text": html_texto,
+        "parse_mode": "HTML",  # Mais seguro que Markdown em textos variados
+        "disable_web_page_preview": True
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            print(f"Bot API falhou: HTTP {r.status_code} → {r.text}")
+        else:
+            print("Notificação enviada via Bot API com sucesso.")
+    except Exception as e:
+        print(f"Erro ao enviar push: {e}")
 
 print("Conectando como usuário...")
-client = TelegramClient("minha_sessao", API_ID, API_HASH)
+client = TelegramClient("sessao_hf", API_ID, API_HASH)  # sessão exclusiva no HF
 
 @client.on(events.NewMessage)
 async def handler(event):
-    if event.out:  # ignora mensagens enviadas por você mesmo
+    if event.out:
         return
 
-    msg_original = event.message.message
+    msg_original = event.message.message or ""
     if not msg_original:
         return
 
@@ -80,32 +94,33 @@ async def handler(event):
 
     for termo in TERMOS:
         termo_limpo = normalize(termo)
-        if termo_limpo in msg_limpa:
+        if termo_limpo and termo_limpo in msg_limpa:
             print(f"--> Termo '{termo}' encontrado em: {chat_title}")
 
+            # Link direto para a mensagem
             try:
                 msg_link = f"https://t.me/c/{chat.id}/{event.message.id}"
-                if hasattr(chat, "username") and chat.username:
+                if getattr(chat, "username", None):
                     msg_link = f"https://t.me/{chat.username}/{event.message.id}"
             except Exception:
                 msg_link = "Link indisponível"
 
-            alerta = (
-                f"🚨 **ACHEI UMA OFERTA!** 🚨\n\n"
-                f"**Termo:** `{termo}`\n"
-                f"**Onde:** {chat_title}\n"
-                f"**Link:** [Ir para mensagem]({msg_link})\n\n"
-                f"-----------\n"
+            # HTML seguro para Bot API
+            alerta_html = (
+                "🚨 <b>ACHEI UMA OFERTA!</b> 🚨\n\n"
+                f"<b>Termo:</b> <code>{termo}</code>\n"
+                f"<b>Onde:</b> {chat_title}\n"
+                f"<b>Link:</b> {msg_link}\n\n"
+                "-----------\n"
                 f"{msg_original[:200]}..."
             )
 
+            # 1. Log no seu próprio Saved Messages (via userbot)
+            await client.send_message("me", alerta_html, parse_mode="html")
 
-            # 1. Salva no seu histórico (Userbot) - Sem notificação
-            await client.send_message('me', alerta)
-            
-            # 2. Manda o Bot te avisar (Push Notification) - Com som!
-            enviar_notificacao_push(alerta)
-            
+            # 2. Bot te avisar (Push Notification)
+            enviar_notificacao_push(alerta_html)
+
             break
 
 async def main():
