@@ -14,7 +14,6 @@ try:
 except Exception as e:
     print("Erro ao resolver api.telegram.org:", e)
 
-
 # --- Servidor FastAPI para manter o Space "Running"
 from fastapi import FastAPI
 import uvicorn
@@ -52,8 +51,7 @@ DESTINO_ID_ENV = os.getenv("DESTINO_ID", "").strip()
 try:
     DESTINO_ID = int(DESTINO_ID_ENV)
 except ValueError:
-    # Permite usar @username, mas é menos confiável para Bot API
-    DESTINO_ID = DESTINO_ID_ENV
+    DESTINO_ID = DESTINO_ID_ENV  # Permite usar @username
 
 def normalize(text):
     if not text:
@@ -77,27 +75,28 @@ def enviar_notificacao_push(html_texto):
     except Exception as e:
         print(f"Erro ao enviar push para Vercel: {e}")
 
-
 print("Conectando como usuário...")
-client = TelegramClient("minha_sessao", API_ID, API_HASH)  # sessão exclusiva no HF
+client = TelegramClient("minha_sessao", API_ID, API_HASH)  # sessão exclusiva no minha_sessao
+
+# cache global para evitar processar a mesma mensagem várias vezes
+mensagens_processadas = set()
 
 @client.on(events.NewMessage)
 async def handler(event):
     if event.out:
         return
 
-    # evita repetir a mesma mensagem 
-    if event.id in mensagens_processadas: 
-        return 
-        mensagens_processadas.add(event.id)
-    
+    # evita repetir a mesma mensagem
+    if event.id in mensagens_processadas:
+        return
+    mensagens_processadas.add(event.id)
+
     msg_original = event.message.message or ""
     if not msg_original:
         return
 
     chat = await event.get_chat()
     chat_title = getattr(chat, "title", "Chat Privado")
-
 
     msg_limpa = normalize(msg_original)
 
@@ -124,10 +123,9 @@ async def handler(event):
                 f"{msg_original[:200]}..."
             )
 
-
             # 1. Log no seu próprio Saved Messages (via userbot)
             await client.send_message("me", alerta_html, parse_mode="html")
-            
+
             # 2. Bot te avisar (Push Notification)
             enviar_notificacao_push(alerta_html)
 
@@ -137,9 +135,9 @@ async def main():
     await client.start(phone=PHONE_NUMBER)
     print("Userbot rodando! Monitorando tudo que você recebe...")
 
-    # TESTE DIRETO: dispara uma notificação ao iniciar 
+    # TESTE DIRETO: dispara uma notificação ao iniciar
     enviar_notificacao_push("<b>Teste direto do Hugging Face</b>")
-    
+
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
