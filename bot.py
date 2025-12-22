@@ -92,8 +92,7 @@ async def handler(event):
 
     chat = await event.get_chat()
     chat_title = getattr(chat, "title", "Chat Privado")
-        if getattr(chat, "id", None) == (await client.get_me()).id: 
-            return
+
 
     msg_limpa = normalize(msg_original)
 
@@ -119,9 +118,6 @@ async def handler(event):
                 "-----------\n"
                 f"{msg_original[:200]}..."
             )
-
-            # 1. Log no seu próprio Saved Messages (via userbot)
-            await client.send_message("me", alerta_html, parse_mode="html")
 
             # 2. Bot te avisar (Push Notification)
             enviar_notificacao_push(alerta_html)
