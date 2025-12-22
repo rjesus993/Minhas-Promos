@@ -64,24 +64,19 @@ def normalize(text):
     return text
 
 def enviar_notificacao_push(html_texto):
-    if not BOT_TOKEN or not DESTINO_ID:
-        print("BOT_TOKEN ou DESTINO_ID não definidos; notificações desativadas.")
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": DESTINO_ID,
-        "text": html_texto,
-        "parse_mode": "HTML",  # Mais seguro que Markdown em textos variados
-        "disable_web_page_preview": True
-    }
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(
+            "https://monitor-automacao.vercel.app/api/notify",
+            json={"texto": html_texto},
+            timeout=10
+        )
         if r.status_code != 200:
-            print(f"Bot API falhou: HTTP {r.status_code} → {r.text}")
+            print(f"Falha ao enviar para Vercel: HTTP {r.status_code} → {r.text}")
         else:
-            print("Notificação enviada via Bot API com sucesso.")
+            print("Notificação enviada via Vercel com sucesso.")
     except Exception as e:
-        print(f"Erro ao enviar push: {e}")
+        print(f"Erro ao enviar push para Vercel: {e}")
+
 
 print("Conectando como usuário...")
 client = TelegramClient("minha_sessao", API_ID, API_HASH)  # sessão exclusiva no HF
