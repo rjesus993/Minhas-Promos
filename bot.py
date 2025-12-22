@@ -76,7 +76,7 @@ def enviar_notificacao_push(html_texto):
         print(f"Erro ao enviar push: {e}")
 
 print("Conectando como usuário...")
-client = TelegramClient("sessao_hf", API_ID, API_HASH)  # sessão exclusiva no HF
+client = TelegramClient("minha_sessao", API_ID, API_HASH)  # sessão exclusiva no HF
 
 @client.on(events.NewMessage)
 async def handler(event):
