@@ -8,6 +8,7 @@ from telethon import TelegramClient, events
 from dotenv import load_dotenv
 import socket
 
+# Teste de DNS (apenas informativo)
 try:
     ip = socket.gethostbyname("api.telegram.org")
     print("api.telegram.org resolve para:", ip)
@@ -45,7 +46,7 @@ PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 TERMOS_ENV = os.getenv("TERMOS", "")
 TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
 
-# Configurações de Notificação do Bot
+# Configurações de Notificação do Bot (usadas pelo endpoint no Vercel)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DESTINO_ID_ENV = os.getenv("DESTINO_ID", "").strip()
 try:
@@ -83,15 +84,27 @@ mensagens_processadas = set()
 
 @client.on(events.NewMessage)
 async def handler(event):
+    # Ignora mensagens que você mesmo enviou (evita loop)
     if event.out:
         return
 
-# ignora mensagens enviadas para o próprio usuário (Saved Messages) 
-    if event.is_private: 
-        me = await client.get_me() 
-        if event.chat_id == me.id: 
+    # Ignora mensagens salvas no próprio "me" (Saved Messages) para evitar loop do log
+    me = await client.get_me()
+    if event.chat_id == me.id:
+        return
+
+    # Ignora mensagens vindas de bots (evita loop com rjesus99_bot e outros)
+    try:
+        sender = await event.get_sender()
+        if getattr(sender, "bot", False):
             return
-    
+        # Ignora especificamente o rjesus99_bot, se necessário
+        if getattr(sender, "username", "") and sender.username.lower() == "rjesus99_bot":
+            return
+    except Exception:
+        # Se não conseguir obter sender, continua (mas o cache ainda protege de loops)
+        pass
+
     # evita repetir a mesma mensagem
     if event.id in mensagens_processadas:
         return
@@ -135,6 +148,7 @@ async def handler(event):
             # 2. Bot te avisar (Push Notification)
             enviar_notificacao_push(alerta_html)
 
+            # Garante apenas uma notificação por mensagem
             break
 
 async def main():
