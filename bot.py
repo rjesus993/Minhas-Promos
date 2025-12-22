@@ -92,6 +92,8 @@ async def handler(event):
 
     chat = await event.get_chat()
     chat_title = getattr(chat, "title", "Chat Privado")
+        if getattr(chat, "id", None) == (await client.get_me()).id: 
+            return
 
     msg_limpa = normalize(msg_original)
 
