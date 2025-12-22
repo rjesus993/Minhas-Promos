@@ -2,13 +2,29 @@ import os
 import logging
 import unicodedata
 import asyncio
+import threading
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 
-# Carrega configurações
+# --- Servidor FastAPI para manter o Space "Running"
+from fastapi import FastAPI
+import uvicorn
+
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"status": "running", "message": "Userbot ativo no Hugging Face"}
+
+def start_server():
+    uvicorn.run(app, host="0.0.0.0", port=7860)
+
+# Inicia o servidor em paralelo (thread separada)
+threading.Thread(target=start_server, daemon=True).start()
+
+# --- Configuração do Userbot
 load_dotenv()
 
-# Configuração de Logs
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -19,7 +35,6 @@ API_HASH = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 TERMOS = os.getenv("TERMOS").split(",")
 
-# Função de limpeza de texto
 def normalize(text):
     if not text:
         return ""
@@ -28,7 +43,6 @@ def normalize(text):
     text = "".join([c for c in text if not unicodedata.combining(c)])
     return text
 
-# Inicia o cliente como USUÁRIO (Userbot)
 print("Conectando como usuário...")
 client = TelegramClient("minha_sessao", API_ID, API_HASH)
 
@@ -51,7 +65,6 @@ async def handler(event):
         if termo_limpo in msg_limpa:
             print(f"--> Termo '{termo}' encontrado em: {chat_title}")
 
-            # Link direto para a mensagem
             try:
                 msg_link = f"https://t.me/c/{chat.id}/{event.message.id}"
                 if hasattr(chat, "username") and chat.username:
@@ -72,7 +85,6 @@ async def handler(event):
             break
 
 async def main():
-    # Isso vai pedir o código de login do Telegram na primeira vez
     await client.start(phone=PHONE_NUMBER)
     print("Userbot rodando! Monitorando tudo que você recebe...")
     await client.run_until_disconnected()
