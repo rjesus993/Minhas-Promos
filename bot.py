@@ -126,6 +126,10 @@ async def handler(event):
 async def main():
     await client.start(phone=PHONE_NUMBER)
     print("Userbot rodando! Monitorando tudo que você recebe...")
+
+    # TESTE DIRETO: dispara uma notificação ao iniciar 
+    enviar_notificacao_push("<b>Teste direto do Hugging Face</b>")
+    
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
