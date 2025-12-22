@@ -119,7 +119,7 @@ async def handler(event):
             try:
                 msg_link = f"https://t.me/c/{chat.id}/{event.message.id}"
                 if getattr(chat, "username", None):
-                    msg_link = f"https://t.me/{chat.username}/{event.message.id}"
+                    msg_link = f"https://t.me/c/{str(chat.id)[4:]}/{event.message.id}"
             except Exception:
                 msg_link = "Link indisponível"
 
