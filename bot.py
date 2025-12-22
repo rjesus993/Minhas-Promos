@@ -86,6 +86,12 @@ async def handler(event):
     if event.out:
         return
 
+# ignora mensagens enviadas para o próprio usuário (Saved Messages) 
+    if event.is_private: 
+        me = await client.get_me() 
+        if event.chat_id == me.id: 
+            return
+    
     # evita repetir a mesma mensagem
     if event.id in mensagens_processadas:
         return
