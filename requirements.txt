@@ -3,3 +3,4 @@ Telethon
 python-dotenv
 fastapi
 uvicorn
+requests
