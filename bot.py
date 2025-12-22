@@ -119,6 +119,10 @@ async def handler(event):
                 f"{msg_original[:200]}..."
             )
 
+
+            # 1. Log no seu próprio Saved Messages (via userbot)
+            await client.send_message("me", alerta_html, parse_mode="html")
+            
             # 2. Bot te avisar (Push Notification)
             enviar_notificacao_push(alerta_html)
 
