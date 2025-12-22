@@ -35,6 +35,10 @@ API_HASH = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 TERMOS = os.getenv("TERMOS").split(",")
 
+# Configurações de Notificação do Bot
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DESTINO_ID = os.getenv("DESTINO_ID")
+
 def normalize(text):
     if not text:
         return ""
@@ -42,6 +46,20 @@ def normalize(text):
     text = unicodedata.normalize("NFKD", text)
     text = "".join([c for c in text if not unicodedata.combining(c)])
     return text
+
+def enviar_notificacao_push(texto):
+    if BOT_TOKEN and DESTINO_ID:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        data = {
+            "chat_id": DESTINO_ID,
+            "text": texto,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        try:
+            requests.post(url, data=data)
+        except Exception as e:
+            print(f"Erro ao enviar push: {e}")
 
 print("Conectando como usuário...")
 client = TelegramClient("minha_sessao", API_ID, API_HASH)
@@ -81,7 +99,13 @@ async def handler(event):
                 f"{msg_original[:200]}..."
             )
 
-            await client.send_message("me", alerta)
+
+            # 1. Salva no seu histórico (Userbot) - Sem notificação
+            await client.send_message('me', alerta)
+            
+            # 2. Manda o Bot te avisar (Push Notification) - Com som!
+            enviar_notificacao_push(alerta)
+            
             break
 
 async def main():
