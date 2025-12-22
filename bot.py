@@ -6,6 +6,14 @@ import threading
 import requests  # IMPORTANTE
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
+import socket
+
+try:
+    ip = socket.gethostbyname("api.telegram.org")
+    print("api.telegram.org resolve para:", ip)
+except Exception as e:
+    print("Erro ao resolver api.telegram.org:", e)
+
 
 # --- Servidor FastAPI para manter o Space "Running"
 from fastapi import FastAPI
