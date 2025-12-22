@@ -86,6 +86,11 @@ async def handler(event):
     if event.out:
         return
 
+    # evita repetir a mesma mensagem 
+    if event.id in mensagens_processadas: 
+        return 
+        mensagens_processadas.add(event.id)
+    
     msg_original = event.message.message or ""
     if not msg_original:
         return
