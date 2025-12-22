@@ -4,4 +4,3 @@ python-dotenv
 fastapi
 uvicorn
 requests
-cryptg
