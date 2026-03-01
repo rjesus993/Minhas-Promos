@@ -3,10 +3,13 @@ import logging
 import unicodedata
 import asyncio
 import threading
-import requests  # IMPORTANTE
+import requests
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 import socket
+import json
+import time
+import sys
 
 # Teste de DNS (apenas informativo)
 try:
@@ -42,9 +45,25 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 
-# TERMOS com strip para evitar falhas por espaços
+# --- Persistência de TERMOS ---
+TERMOS_FILE = "termos_cache.json"
+
+def load_terms():
+    if os.path.exists(TERMOS_FILE):
+        with open(TERMOS_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_terms(terms):
+    with open(TERMOS_FILE, "w") as f:
+        json.dump(terms, f)
+
 TERMOS_ENV = os.getenv("TERMOS", "")
-TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
+if not TERMOS_ENV.strip():
+    TERMOS = load_terms()
+else:
+    TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
+    save_terms(TERMOS)
 
 # Configurações de Notificação do Bot (usadas pelo endpoint no Vercel)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -77,7 +96,7 @@ def enviar_notificacao_push(html_texto):
         print(f"Erro ao enviar push para Vercel: {e}")
 
 print("Conectando como usuário...")
-client = TelegramClient("minha_sessao", API_ID, API_HASH)  # sessão exclusiva no minha_sessao
+client = TelegramClient("minha_sessao", API_ID, API_HASH)
 
 # cache global para evitar processar a mesma mensagem várias vezes
 mensagens_processadas = set()
@@ -145,9 +164,13 @@ async def handler(event):
 async def main():
     await client.start(phone=PHONE_NUMBER)
     print("Userbot rodando! Monitorando tudo que você recebe...")
-
-    # TESTE DIRETO: dispara uma notificação ao iniciar
-    enviar_notificacao_push("<b>Teste direto do Hugging Face</b>")
+    
+    # Envia notificação de teste apenas após conexão bem-sucedida
+    try:
+        await client.send_message("me", "<b>Teste direto do Hugging Face</b>", parse_mode="html")
+        enviar_notificacao_push("<b>Teste direto do Hugging Face</b>")
+    except Exception as e:
+        print(f"Erro ao enviar teste: {e}")
 
     await client.run_until_disconnected()
 
