@@ -3,13 +3,11 @@ import logging
 import unicodedata
 import asyncio
 import threading
-import requests
+import requests  # IMPORTANTE
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 import socket
-import json
-import time
-import sys
+from datetime import datetime
 
 # Teste de DNS (apenas informativo)
 try:
@@ -45,25 +43,9 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 
-# --- Persistência de TERMOS ---
-TERMOS_FILE = "termos_cache.json"
-
-def load_terms():
-    if os.path.exists(TERMOS_FILE):
-        with open(TERMOS_FILE, "r") as f:
-            return json.load(f)
-    return []
-
-def save_terms(terms):
-    with open(TERMOS_FILE, "w") as f:
-        json.dump(terms, f)
-
+# TERMOS com strip para evitar falhas por espaços
 TERMOS_ENV = os.getenv("TERMOS", "")
-if not TERMOS_ENV.strip():
-    TERMOS = load_terms()
-else:
-    TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
-    save_terms(TERMOS)
+TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
 
 # Configurações de Notificação do Bot (usadas pelo endpoint no Vercel)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -72,6 +54,27 @@ try:
     DESTINO_ID = int(DESTINO_ID_ENV)
 except ValueError:
     DESTINO_ID = DESTINO_ID_ENV  # Permite usar @username
+
+# --- Persistência de Termos ---
+def salvar_termos():
+    """Salva os termos em um arquivo para persistência"""
+    try:
+        with open("termos_config.txt", "w", encoding="utf-8") as f:
+            f.write(",".join(TERMOS))
+    except Exception as e:
+        print(f"Erro ao salvar termos: {e}")
+
+def carregar_termos_do_arquivo():
+    """Carrega os termos do arquivo"""
+    global TERMOS
+    try:
+        if os.path.exists("termos_config.txt"):
+            with open("termos_config.txt", "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    TERMOS = [t.strip() for t in content.split(",") if t.strip()]
+    except Exception as e:
+        print(f"Erro ao carregar termos: {e}")
 
 def normalize(text):
     if not text:
@@ -96,7 +99,7 @@ def enviar_notificacao_push(html_texto):
         print(f"Erro ao enviar push para Vercel: {e}")
 
 print("Conectando como usuário...")
-client = TelegramClient("minha_sessao", API_ID, API_HASH)
+client = TelegramClient("minha_sessao", API_ID, API_HASH)  # sessão exclusiva no minha_sessao
 
 # cache global para evitar processar a mesma mensagem várias vezes
 mensagens_processadas = set()
@@ -161,16 +164,67 @@ async def handler(event):
             # Garante apenas uma notificação por mensagem
             break
 
+# --- Comandos do Telegram para gerenciamento de termos ---
+@client.on(events.NewMessage(pattern='/settermos'))
+async def set_termos_handler(event):
+    if event.out:
+        return
+    
+    try:
+        message_text = event.message.message
+        novos_termos_str = message_text[10:].strip()  # Remove '/settermos '
+        
+        if not novos_termos_str:
+            await event.reply("Por favor, envie os termos separados por vírgula. Exemplo: /settermos notebook,iphone,smartphone")
+            return
+            
+        global TERMOS
+        TERMOS = [t.strip() for t in novos_termos_str.split(",") if t.strip()]
+        
+        salvar_termos()
+        
+        await event.reply(f"Termos atualizados com sucesso! Termos atuais: {', '.join(TERMOS)}")
+        
+    except Exception as e:
+        print(f"Erro ao processar /settermos: {e}")
+        await event.reply("Erro ao atualizar termos. Verifique o formato.")
+
+@client.on(events.NewMessage(pattern='/gettermos'))
+async def get_termos_handler(event):
+    if event.out:
+        return
+    
+    try:
+        termos_str = ", ".join(TERMOS) if TERMOS else "Nenhum termo configurado"
+        await event.reply(f"Termos atuais: {termos_str}")
+    except Exception as e:
+        print(f"Erro ao processar /gettermos: {e}")
+        await event.reply("Erro ao recuperar termos.")
+
+@client.on(events.NewMessage(pattern='/resettermos'))
+async def reset_termos_handler(event):
+    if event.out:
+        return
+    
+    try:
+        global TERMOS
+        TERMOS = []
+        salvar_termos()
+        await event.reply("Termos resetados com sucesso!")
+    except Exception as e:
+        print(f"Erro ao processar /resettermos: {e}")
+        await event.reply("Erro ao resetar termos.")
+
 async def main():
     await client.start(phone=PHONE_NUMBER)
     print("Userbot rodando! Monitorando tudo que você recebe...")
-    
-    # Envia notificação de teste apenas após conexão bem-sucedida
-    try:
-        await client.send_message("me", "<b>Teste direto do Hugging Face</b>", parse_mode="html")
-        enviar_notificacao_push("<b>Teste direto do Hugging Face</b>")
-    except Exception as e:
-        print(f"Erro ao enviar teste: {e}")
+
+    # Carrega os termos do arquivo ao iniciar
+    carregar_termos_do_arquivo()
+    print(f"Termos carregados: {TERMOS}")
+
+    # TESTE DIRETO: dispara uma notificação ao iniciar
+    enviar_notificacao_push("<b>Teste direto do Hugging Face</b>")
 
     await client.run_until_disconnected()
 
