@@ -3,10 +3,12 @@ import logging
 import unicodedata
 import asyncio
 import threading
-import requests  # IMPORTANTE
+import requests
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 import socket
+import json
+import time
 
 # Teste de DNS (apenas informativo)
 try:
@@ -42,9 +44,25 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 
-# TERMOS com strip para evitar falhas por espaços
+# --- Persistência de TERMOS ---
+TERMOS_FILE = "termos_cache.json"
+
+def load_terms():
+    if os.path.exists(TERMOS_FILE):
+        with open(TERMOS_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_terms(terms):
+    with open(TERMOS_FILE, "w") as f:
+        json.dump(terms, f)
+
 TERMOS_ENV = os.getenv("TERMOS", "")
-TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
+if not TERMOS_ENV.strip():
+    TERMOS = load_terms()
+else:
+    TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
+    save_terms(TERMOS)
 
 # Configurações de Notificação do Bot (usadas pelo endpoint no Vercel)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -76,19 +94,29 @@ def enviar_notificacao_push(html_texto):
     except Exception as e:
         print(f"Erro ao enviar push para Vercel: {e}")
 
-print("Conectando como usuário...")
-client = TelegramClient("minha_sessao", API_ID, API_HASH)  # sessão exclusiva no minha_sessao
+# --- Persistência de mensagens processadas ---
+MESSAGES_FILE = "mensagens_processadas.json"
 
-# cache global para evitar processar a mesma mensagem várias vezes
-mensagens_processadas = set()
+def load_processed():
+    if os.path.exists(MESSAGES_FILE):
+        with open(MESSAGES_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+def save_processed(processed):
+    with open(MESSAGES_FILE, "w") as f:
+        json.dump(list(processed), f)
+
+mensagens_processadas = load_processed()
+
+print("Conectando como usuário...")
+client = TelegramClient("minha_sessao", API_ID, API_HASH)
 
 @client.on(events.NewMessage)
 async def handler(event):
-    # Ignora mensagens que você mesmo enviou (evita loop)
     if event.out:
         return
 
-    # Ignora mensagens vindas especificamente do rjesus99_bot
     try:
         sender = await event.get_sender()
         if getattr(sender, "username", "") and sender.username.lower() == "rjesus99_bot":
@@ -96,10 +124,10 @@ async def handler(event):
     except Exception:
         pass
 
-    # evita repetir a mesma mensagem
     if event.id in mensagens_processadas:
         return
     mensagens_processadas.add(event.id)
+    save_processed(mensagens_processadas)
 
     msg_original = event.message.message or ""
     if not msg_original:
@@ -115,7 +143,6 @@ async def handler(event):
         if termo_limpo and termo_limpo in msg_limpa:
             print(f"--> Termo '{termo}' encontrado em: {chat_title}")
 
-            # Link direto para a mensagem
             try:
                 msg_link = f"https://t.me/c/{chat.id}/{event.message.id}"
                 if getattr(chat, "username", None):
@@ -123,7 +150,6 @@ async def handler(event):
             except Exception:
                 msg_link = "Link indisponível"
 
-            # HTML seguro para Bot API
             alerta_html = (
                 "🚨 <b>ACHEI UMA OFERTA!</b> 🚨\n\n"
                 f"<b>Termo:</b> <code>{termo}</code>\n"
@@ -133,23 +159,26 @@ async def handler(event):
                 f"{msg_original[:200]}..."
             )
 
-            # 1. Log no seu próprio Saved Messages (via userbot)
             await client.send_message("me", alerta_html, parse_mode="html")
-
-            # 2. Bot te avisar (Push Notification)
             enviar_notificacao_push(alerta_html)
-
-            # Garante apenas uma notificação por mensagem
             break
 
 async def main():
     await client.start(phone=PHONE_NUMBER)
     print("Userbot rodando! Monitorando tudo que você recebe...")
 
-    # TESTE DIRETO: dispara uma notificação ao iniciar
     enviar_notificacao_push("<b>Teste direto do Hugging Face</b>")
+
+    # Reinicialização automática a cada 6 horas (21600 segundos)
+    def restart():
+        print("Reiniciando o bot automaticamente...")
+        os.execv(sys.executable, ['python'] + sys.argv)
+
+    asyncio.create_task(asyncio.sleep(21600))
+    restart()
 
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
+    import sys
     asyncio.run(main())
