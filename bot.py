@@ -3,11 +3,10 @@ import logging
 import unicodedata
 import asyncio
 import threading
-import requests  # IMPORTANTE
+import requests
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 import socket
-from datetime import datetime
 
 # Teste de DNS (apenas informativo)
 try:
@@ -55,27 +54,6 @@ try:
 except ValueError:
     DESTINO_ID = DESTINO_ID_ENV  # Permite usar @username
 
-# --- Persistência de Termos ---
-def salvar_termos():
-    """Salva os termos em um arquivo para persistência"""
-    try:
-        with open("termos_config.txt", "w", encoding="utf-8") as f:
-            f.write(",".join(TERMOS))
-    except Exception as e:
-        print(f"Erro ao salvar termos: {e}")
-
-def carregar_termos_do_arquivo():
-    """Carrega os termos do arquivo"""
-    global TERMOS
-    try:
-        if os.path.exists("termos_config.txt"):
-            with open("termos_config.txt", "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    TERMOS = [t.strip() for t in content.split(",") if t.strip()]
-    except Exception as e:
-        print(f"Erro ao carregar termos: {e}")
-
 def normalize(text):
     if not text:
         return ""
@@ -98,11 +76,53 @@ def enviar_notificacao_push(html_texto):
     except Exception as e:
         print(f"Erro ao enviar push para Vercel: {e}")
 
+# --- Funções de persistência ---
+def salvar_termos_arquivo(termos):
+    """Salva os termos em um arquivo txt"""
+    try:
+        with open("termos_config.txt", "w", encoding="utf-8") as f:
+            f.write(",".join(termos))
+        print(f"Termos salvos no arquivo: {termos}")
+        return True
+    except Exception as e:
+        print(f"Erro ao salvar termos no arquivo: {e}")
+        return False
+
+def carregar_termos_arquivo():
+    """Carrega os termos do arquivo txt"""
+    try:
+        if os.path.exists("termos_config.txt"):
+            with open("termos_config.txt", "r", encoding="utf-8") as f:
+                conteudo = f.read().strip()
+                if conteudo:
+                    termos = [t.strip() for t in conteudo.split(",") if t.strip()]
+                    print(f"Termos carregados do arquivo: {termos}")
+                    return termos
+                else:
+                    print("Arquivo vazio, usando valores iniciais")
+                    return []
+        else:
+            print("Arquivo termos_config.txt não encontrado")
+            return []
+    except Exception as e:
+        print(f"Erro ao carregar termos do arquivo: {e}")
+        return []
+
 print("Conectando como usuário...")
-client = TelegramClient("minha_sessao", API_ID, API_HASH)  # sessão exclusiva no minha_sessao
+client = TelegramClient("minha_sessao", API_ID, API_HASH)
 
 # cache global para evitar processar a mesma mensagem várias vezes
 mensagens_processadas = set()
+
+# --- Carrega os termos ao iniciar ---
+TERMOS = carregar_termos_arquivo()
+if not TERMOS:
+    # Se não tiver carregado do arquivo, usa os valores do .env
+    TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
+    print("Usando termos do ambiente (.env):", TERMOS)
+    salvar_termos_arquivo(TERMOS)  # Salva para criar o arquivo inicial
+
+print(f"Termos carregados ao iniciar: {TERMOS}")
 
 @client.on(events.NewMessage)
 async def handler(event):
@@ -164,64 +184,59 @@ async def handler(event):
             # Garante apenas uma notificação por mensagem
             break
 
-# --- Comandos do Telegram para gerenciamento de termos ---
+# --- Comandos do bot ---
+@client.on(events.NewMessage(pattern='/start'))
+async def start_handler(event):
+    await event.reply("Olá! Estou monitorando mensagens para os termos: " + ", ".join(TERMOS))
+
+@client.on(events.NewMessage(pattern='/termos'))
+async def list_termos_handler(event):
+    if not TERMOS:
+        await event.reply("Nenhum termo configurado.")
+    else:
+        await event.reply("Termos atuais:\n" + "\n".join(f"• {t}" for t in TERMOS))
+
 @client.on(events.NewMessage(pattern='/settermos'))
 async def set_termos_handler(event):
-    if event.out:
-        return
-    
     try:
-        message_text = event.message.message
-        novos_termos_str = message_text[10:].strip()  # Remove '/settermos '
+        # Extrai os termos após o comando
+        text = event.message.message
+        if len(text) < 10:  # "/settermos " tem 10 caracteres
+            await event.reply("Use: /settermos termo1,termo2,termo3")
+            return
+            
+        novos_termos = [t.strip() for t in text[10:].split(",") if t.strip()]
         
-        if not novos_termos_str:
-            await event.reply("Por favor, envie os termos separados por vírgula. Exemplo: /settermos notebook,iphone,smartphone")
+        if not novos_termos:
+            await event.reply("Nenhum termo válido fornecido.")
             return
             
         global TERMOS
-        TERMOS = [t.strip() for t in novos_termos_str.split(",") if t.strip()]
+        TERMOS = novos_termos
         
-        salvar_termos()
-        
-        await event.reply(f"Termos atualizados com sucesso! Termos atuais: {', '.join(TERMOS)}")
-        
+        # Salva no arquivo
+        if salvar_termos_arquivo(TERMOS):
+            await event.reply(f"Termos atualizados com sucesso!\n\n{', '.join(TERMOS)}")
+        else:
+            await event.reply("Erro ao salvar os termos.")
+            
     except Exception as e:
-        print(f"Erro ao processar /settermos: {e}")
-        await event.reply("Erro ao atualizar termos. Verifique o formato.")
+        print(f"Erro no comando /settermos: {e}")
+        await event.reply("Erro ao processar o comando.")
 
-@client.on(events.NewMessage(pattern='/gettermos'))
-async def get_termos_handler(event):
-    if event.out:
-        return
+@client.on(events.NewMessage(pattern='/reset'))
+async def reset_handler(event):
+    global TERMOS
+    # Recarrega os termos do arquivo ou do .env
+    TERMOS = carregar_termos_arquivo()
+    if not TERMOS:
+        TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
     
-    try:
-        termos_str = ", ".join(TERMOS) if TERMOS else "Nenhum termo configurado"
-        await event.reply(f"Termos atuais: {termos_str}")
-    except Exception as e:
-        print(f"Erro ao processar /gettermos: {e}")
-        await event.reply("Erro ao recuperar termos.")
-
-@client.on(events.NewMessage(pattern='/resettermos'))
-async def reset_termos_handler(event):
-    if event.out:
-        return
-    
-    try:
-        global TERMOS
-        TERMOS = []
-        salvar_termos()
-        await event.reply("Termos resetados com sucesso!")
-    except Exception as e:
-        print(f"Erro ao processar /resettermos: {e}")
-        await event.reply("Erro ao resetar termos.")
+    await event.reply(f"Termos resetados para: {', '.join(TERMOS)}")
 
 async def main():
     await client.start(phone=PHONE_NUMBER)
     print("Userbot rodando! Monitorando tudo que você recebe...")
-
-    # Carrega os termos do arquivo ao iniciar
-    carregar_termos_do_arquivo()
-    print(f"Termos carregados: {TERMOS}")
 
     # TESTE DIRETO: dispara uma notificação ao iniciar
     enviar_notificacao_push("<b>Teste direto do Hugging Face</b>")
