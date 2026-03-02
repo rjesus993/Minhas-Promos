@@ -3,7 +3,7 @@ import asyncio
 import logging
 import requests
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, ConnectionError
+from telethon.errors import FloodWaitError
 from config import API_ID, API_HASH, PHONE_NUMBER, BOT_TOKEN, DESTINO_ID
 from utils import normalize, contains_term, save_terms_to_db, load_terms_from_db
 from db import init_db, save_terms, load_terms, add_term, remove_term
