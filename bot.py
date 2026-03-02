@@ -1,4 +1,3 @@
-# bot.py
 import os
 import logging
 import unicodedata
@@ -8,15 +7,12 @@ import requests
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 import socket
-import json
 import sqlite3
 import re
 import difflib
 from datetime import datetime, timedelta
-from collections import defaultdict
-import time
 
-# Configuração do logging
+# Configuração de logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -30,11 +26,26 @@ logger = logging.getLogger(__name__)
 # Teste de DNS (apenas informativo)
 try:
     ip = socket.gethostbyname("api.telegram.org")
-    logger.info(f"api.telegram.org resolve para: {ip}")
+    print("api.telegram.org resolve para:", ip)
 except Exception as e:
     logger.error(f"Erro ao resolver api.telegram.org: {e}")
 
-# --- Configuração do Userbot ---
+# --- Servidor FastAPI para manter o Space "Running"
+from fastapi import FastAPI
+import uvicorn
+
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"status": "running", "message": "Userbot ativo no Hugging Face"}
+
+async def start_server():
+    config = uvicorn.Config(app, host="0.0.0.0", port=7860)
+    server = uvicorn.Server(config)
+    await server.serve()
+
+# --- Configuração do Userbot
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID"))
@@ -53,13 +64,38 @@ try:
 except ValueError:
     DESTINO_ID = DESTINO_ID_ENV  # Permite usar @username
 
+def normalize(text):
+    if not text:
+        return ""
+    text = text.lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join([c for c in text if not unicodedata.combining(c)])
+    return text
+
+def enviar_notificacao_push(html_texto):
+    try:
+        r = requests.post(
+            "https://monitor-automacao.vercel.app/api/notify",
+            json={"texto": html_texto},
+            timeout=10,
+            verify=True
+        )
+        if r.status_code != 200:
+            logger.warning(f"Falha ao enviar para Vercel: HTTP {r.status_code} → {r.text}")
+        else:
+            logger.info("Notificação enviada via Vercel com sucesso.")
+    except requests.Timeout:
+        logger.error("Tempo limite excedido ao enviar notificação")
+    except requests.ConnectionError:
+        logger.error("Erro de conexão ao enviar notificação")
+    except Exception as e:
+        logger.error(f"Erro ao enviar push para Vercel: {e}")
+
 # --- Funções de persistência ---
 def init_db():
-    """Inicializa o banco de dados SQLite para armazenar termos"""
+    """Inicializa o banco de dados SQLite"""
     conn = sqlite3.connect('termos.db')
     cursor = conn.cursor()
-    
-    # Tabela para armazenar os termos
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS termos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,41 +103,19 @@ def init_db():
             criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
-    # Tabela para histórico de alterações
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS historico_termos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            acao TEXT NOT NULL,
-            termos_antigos TEXT,
-            termos_novos TEXT,
-            data TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
     conn.commit()
     conn.close()
 
 def salvar_termos_db(termos):
-    """Salva os termos no banco de dados"""
+    """Salva os termos no banco de dados SQLite"""
     try:
         conn = sqlite3.connect('termos.db')
         cursor = conn.cursor()
-        
-        # Registrar histórico
-        cursor.execute("INSERT INTO historico_termos (acao, termos_novos) VALUES (?, ?)", 
-                      ("ATUALIZAR", ",".join(termos)))
-        
-        # Limpar termos antigos
-        cursor.execute("DELETE FROM termos")
-        
-        # Inserir novos termos
         for termo in termos:
             try:
-                cursor.execute("INSERT INTO termos (termo) VALUES (?)", (termo,))
+                cursor.execute("INSERT OR IGNORE INTO termos (termo) VALUES (?)", (termo,))
             except sqlite3.IntegrityError:
                 pass  # Termo já existe
-        
         conn.commit()
         conn.close()
         logger.info(f"Termos salvos no banco: {termos}")
@@ -111,15 +125,12 @@ def salvar_termos_db(termos):
         return False
 
 def carregar_termos_db():
-    """Carrega os termos do banco de dados"""
+    """Carrega os termos do banco de dados SQLite"""
     try:
         conn = sqlite3.connect('termos.db')
         cursor = conn.cursor()
-        
         cursor.execute("SELECT termo FROM termos ORDER BY criado_em")
-        resultados = cursor.fetchall()
-        termos = [row[0] for row in resultados]
-        
+        termos = [row[0] for row in cursor.fetchall()]
         conn.close()
         logger.info(f"Termos carregados do banco: {termos}")
         return termos
@@ -127,11 +138,63 @@ def carregar_termos_db():
         logger.error(f"Erro ao carregar termos do banco: {e}")
         return []
 
-# Inicializar o banco de dados
+def adicionar_termo_db(termo):
+    """Adiciona um único termo ao banco de dados"""
+    try:
+        conn = sqlite3.connect('termos.db')
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO termos (termo) VALUES (?)", (termo,))
+        conn.commit()
+        conn.close()
+        logger.info(f"Termo adicionado: {termo}")
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao adicionar termo: {e}")
+        return False
+
+def remover_termo_db(termo):
+    """Remove um termo do banco de dados"""
+    try:
+        conn = sqlite3.connect('termos.db')
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM termos WHERE termo=?", (termo,))
+        conn.commit()
+        conn.close()
+        logger.info(f"Termo removido: {termo}")
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao remover termo: {e}")
+        return False
+
+# Inicializa o banco de dados
 init_db()
 
+# --- Cache com TTL ---
+mensagens_processadas = {}
+
+def is_message_expired(msg_id, ttl_minutes=10):
+    """Verifica se a mensagem expirou"""
+    if msg_id not in mensagens_processadas:
+        return True
+    timestamp = mensagens_processadas[msg_id]
+    return datetime.now() > timestamp + timedelta(minutes=ttl_minutes)
+
+def add_message_to_cache(msg_id):
+    """Adiciona mensagem ao cache"""
+    mensagens_processadas[msg_id] = datetime.now()
+
+# --- Carrega os termos ao iniciar ---
+TERMOS = carregar_termos_db()
+if not TERMOS:
+    # Se não tiver carregado do banco, usa os valores do .env
+    TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
+    logger.info("Usando termos do ambiente (.env): " + str(TERMOS))
+    salvar_termos_db(TERMOS)  # Salva para criar o banco inicial
+
+logger.info(f"Termos carregados ao iniciar: {TERMOS}")
+
+# --- Funções auxiliares ---
 def normalize(text):
-    """Normaliza texto para comparação"""
     if not text:
         return ""
     text = text.lower()
@@ -139,81 +202,26 @@ def normalize(text):
     text = "".join([c for c in text if not unicodedata.combining(c)])
     return text
 
-def contains_termo(text, termo, use_regex=False, use_fuzzy=False):
-    """Verifica se o texto contém o termo com diferentes estratégias"""
-    text_norm = normalize(text)
-    termo_norm = normalize(termo)
-    
-    if use_regex:
-        try:
-            return bool(re.search(re.escape(termo_norm), text_norm))
-        except re.error:
-            pass
-    
-    if use_fuzzy:
-        # Usar difflib para correspondência aproximada
-        similarity = difflib.SequenceMatcher(None, termo_norm, text_norm).ratio()
-        return similarity > 0.7  # Limite de similaridade
-    
-    # Busca por substring padrão
-    return termo_norm in text_norm
-
 def enviar_notificacao_push(html_texto):
-    """Envia notificação via Vercel com tratamento de erros"""
     try:
         response = requests.post(
             "https://monitor-automacao.vercel.app/api/notify",
             json={"texto": html_texto},
             timeout=10,
-            verify=True  # Garantir SSL
+            verify=True
         )
-        
         if response.status_code != 200:
             logger.warning(f"Falha ao enviar para Vercel: HTTP {response.status_code} → {response.text}")
         else:
             logger.info("Notificação enviada via Vercel com sucesso.")
-            
     except requests.Timeout:
-        logger.error("Timeout ao tentar enviar notificação")
+        logger.error("Timeout ao enviar notificação")
     except requests.ConnectionError:
         logger.error("Erro de conexão ao enviar notificação")
     except Exception as e:
         logger.error(f"Erro ao enviar push para Vercel: {e}")
 
-# --- Funções auxiliares ---
-class MessageCache:
-    """Cache com TTL para evitar processamento repetido"""
-    def __init__(self, ttl_minutes=10):
-        self.cache = {}
-        self.ttl = ttl_minutes * 60  # Converter minutos para segundos
-        
-    def add(self, message_id):
-        import time
-        self.cache[message_id] = time.time()
-        
-    def contains(self, message_id):
-        import time
-        if message_id in self.cache:
-            if time.time() - self.cache[message_id] > self.ttl:
-                del self.cache[message_id]
-                return False
-            return True
-        return False
-        
-    def clear_expired(self):
-        import time
-        current_time = time.time()
-        expired_keys = [k for k, v in self.cache.items() if current_time - v > self.ttl]
-        for key in expired_keys:
-            del self.cache[key]
-
-# Instância do cache global
-mensagens_processadas = MessageCache()
-
-# --- Configuração do Client ---
-client = TelegramClient("minha_sessao", API_ID, API_HASH)
-
-# --- Handlers e Lógica Principal ---
+# --- Handler principal ---
 @client.on(events.NewMessage)
 async def handler(event):
     # Ignora mensagens que você mesmo enviou (evita loop)
@@ -228,10 +236,10 @@ async def handler(event):
     except Exception:
         pass
 
-    # Evita repetir a mesma mensagem (com TTL)
-    if mensagens_processadas.contains(event.id):
+    # evita repetir a mesma mensagem
+    if not is_message_expired(event.id):
         return
-    mensagens_processadas.add(event.id)
+    add_message_to_cache(event.id)
 
     msg_original = event.message.message or ""
     if not msg_original:
@@ -240,18 +248,25 @@ async def handler(event):
     chat = await event.get_chat()
     chat_title = getattr(chat, "title", "Chat Privado")
 
-    # Obter link mais confiável da mensagem
-    try:
-        msg_link = event.message.link
-        if not msg_link:
-            msg_link = f"https://t.me/c/{chat.id}/{event.message.id}"
-    except Exception:
-        msg_link = "Link indisponível"
+    msg_limpa = normalize(msg_original)
 
+    # Usa regex para busca mais precisa
     for termo in TERMOS:
-        # Usar busca com regex para evitar falsos positivos
-        if contains_termo(msg_original, termo, use_regex=True):
+        termo_limpo = normalize(termo)
+        if termo_limpo and re.search(r'\b' + re.escape(termo_limpo) + r'\b', msg_limpa):
             logger.info(f"--> Termo '{termo}' encontrado em: {chat_title}")
+
+            # Link direto para a mensagem
+            try:
+                if hasattr(event.message, 'link') and event.message.link:
+                    msg_link = event.message.link
+                else:
+                    msg_link = f"https://t.me/c/{chat.id}/{event.message.id}"
+                    if getattr(chat, "username", None):
+                        msg_link = f"https://t.me/{chat.username}/{event.message.id}"
+            except Exception as e:
+                logger.warning(f"Erro ao gerar link: {e}")
+                msg_link = "Link indisponível"
 
             # HTML seguro para Bot API
             alerta_html = (
@@ -287,7 +302,6 @@ async def list_termos_handler(event):
 @client.on(events.NewMessage(pattern='/settermos'))
 async def set_termos_handler(event):
     try:
-        # Extrai os termos após o comando
         text = event.message.message
         if len(text) < 10:  # "/settermos " tem 10 caracteres
             await event.reply("Use: /settermos termo1,termo2,termo3")
@@ -316,13 +330,13 @@ async def set_termos_handler(event):
 async def add_termo_handler(event):
     try:
         text = event.message.message
-        if len(text) < 10:  # "/addtermo " tem 10 caracteres
+        if len(text) < 9:  # "/addtermo " tem 9 caracteres
             await event.reply("Use: /addtermo termo")
             return
             
-        novo_termo = text[10:].strip()
+        novo_termo = text[9:].strip()
         if not novo_termo:
-            await event.reply("Termo inválido.")
+            await event.reply("Nenhum termo válido fornecido.")
             return
             
         global TERMOS
@@ -333,7 +347,7 @@ async def add_termo_handler(event):
             else:
                 await event.reply("Erro ao salvar os termos.")
         else:
-            await event.reply(f"Termo '{novo_termo}' já existe.")
+            await event.reply(f"Termo '{novo_termo}' já está na lista.")
             
     except Exception as e:
         logger.error(f"Erro no comando /addtermo: {e}")
@@ -343,13 +357,13 @@ async def add_termo_handler(event):
 async def del_termo_handler(event):
     try:
         text = event.message.message
-        if len(text) < 10:  # "/deltermo " tem 10 caracteres
+        if len(text) < 9:  # "/deltermo " tem 9 caracteres
             await event.reply("Use: /deltermo termo")
             return
             
-        termo_remover = text[10:].strip()
+        termo_remover = text[9:].strip()
         if not termo_remover:
-            await event.reply("Termo inválido.")
+            await event.reply("Nenhum termo válido fornecido.")
             return
             
         global TERMOS
@@ -360,7 +374,7 @@ async def del_termo_handler(event):
             else:
                 await event.reply("Erro ao salvar os termos.")
         else:
-            await event.reply(f"Termo '{termo_remover}' não encontrado.")
+            await event.reply(f"Termo '{termo_remover}' não encontrado na lista.")
             
     except Exception as e:
         logger.error(f"Erro no comando /deltermo: {e}")
@@ -381,16 +395,20 @@ async def main():
         await client.connect()
         if not await client.is_user_authorized():
             await client.start(phone=PHONE_NUMBER)
-    except Exception as e:
-        logger.error(f"Falha ao conectar ao Telegram: {e}")
-        return
+        print("Userbot rodando! Monitorando tudo que você recebe...")
 
-    logger.info("Userbot rodando! Monitorando tudo que você recebe...")
+        # TESTE DIRETO: dispara uma notificação ao iniciar
+        enviar_notificacao_push("<b>Teste direto do Hugging Face</b>")
 
-    # TESTE DIRETO: dispara uma notificação ao iniciar
-    enviar_notificacao_push("<b>Teste direto do Hugging Face</b>")
-
-    await client.run_until_disconnected()
+        await client.run_until_disconnected()
+    except ConnectionError:
+        print("Falha na conexão com Telegram. Tentando reconectar...")
+        await asyncio.sleep(5)
+        await main()  # Tenta reconectar recursivamente
+    except FloodWaitError as e:
+        print(f"Rate limit excedido, aguardando {e.seconds} segundos...")
+        await asyncio.sleep(e.seconds)
+        await main()
 
 if __name__ == "__main__":
     asyncio.run(main())
