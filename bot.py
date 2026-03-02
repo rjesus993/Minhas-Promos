@@ -220,7 +220,8 @@ async def del_termo_handler(event):
             return
             
         if remove_term(termo):
-            TERMOS = [t for t in TERMOS if t != termo]
+            global TERMOS
+            TERMOS = load_terms_from_db()
             await event.reply(f"Termo '{termo}' removido com sucesso!")
         else:
             await event.reply("Erro ao remover o termo.")
