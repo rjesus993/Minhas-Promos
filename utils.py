@@ -2,38 +2,49 @@
 import unicodedata
 import re
 import difflib
-from typing import List, Optional
+from typing import List
+
 
 def normalize(text: str) -> str:
-    """Normaliza texto para comparação"""
+    """
+    Normaliza texto removendo acentos, deixando minúsculo
+    e facilitando comparações.
+    """
     if not text:
         return ""
     text = text.lower()
     text = unicodedata.normalize("NFKD", text)
-    text = "".join([c for c in text if not unicodedata.combining(c)])
+    text = "".join(c for c in text if not unicodedata.combining(c))
     return text
 
+
 def contains_term(text: str, term: str, use_fuzzy: bool = False) -> bool:
-    """Verifica se o termo está contido no texto"""
+    """
+    Verifica se o termo aparece no texto.
+    Pode usar regex ou comparação aproximada (fuzzy).
+    """
     text_norm = normalize(text)
     term_norm = normalize(term)
-    
-    # Busca por regex
+
+    # Busca direta com regex
     try:
         if re.search(re.escape(term_norm), text_norm):
             return True
     except re.error:
         pass
-    
-    # Busca aproximada com difflib
+
+    # Busca aproximada
     if use_fuzzy:
         ratio = difflib.SequenceMatcher(None, term_norm, text_norm).ratio()
         return ratio > 0.8
-    
+
     return False
 
+
 def save_terms_to_db(terms: List[str]) -> bool:
-    """Salva termos no banco de dados"""
+    """
+    Salva lista de termos no banco (Supabase).
+    """
     try:
         from db import save_terms
         save_terms(terms)
@@ -42,8 +53,11 @@ def save_terms_to_db(terms: List[str]) -> bool:
         print(f"Erro ao salvar termos no banco: {e}")
         return False
 
+
 def load_terms_from_db() -> List[str]:
-    """Carrega termos do banco de dados"""
+    """
+    Carrega lista de termos do banco (Supabase).
+    """
     try:
         from db import load_terms
         return load_terms()
