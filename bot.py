@@ -26,7 +26,8 @@ if not TERMOS:
     save_terms(TERMOS)
 
 # Cria cliente Telegram
-client = TelegramClient("minha_sessao", API_ID, API_HASH)
+from telethon.sessions import StringSession
+client = TelegramClient(StringSession(TELEGRAM_SESSION), API_ID, API_HASH)
 
 async def send_notification_push(html_texto: str):
     """Envia notificação push via Vercel"""
