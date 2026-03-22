@@ -5,11 +5,14 @@ import os
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL ou SUPABASE_KEY não configurados!")
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def save_terms(terms: List[str]) -> bool:
     try:
-        supabase.table("terms").delete().neq("id", 0).execute()
+        supabase.table("terms").delete().neq("term", "").execute()
         for term in terms:
             supabase.table("terms").insert({"term": term}).execute()
         return True
