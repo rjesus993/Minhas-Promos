@@ -3,15 +3,14 @@ import asyncio
 import logging
 import requests
 import time
-import os
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
-from config import API_ID, API_HASH, SESSION
-from utils import normalize, contains_term, load_terms_from_db
-from db import save_terms, load_terms, add_term, remove_term
+from config import API_ID, API_HASH, SESSION, PHONE_NUMBER
+from utils import normalize, contains_term
+from db import save_terms, load_terms, add_term, remove_term, load_terms_from_db
 from server import start_server
 
 # Logging
@@ -31,6 +30,10 @@ if not TERMOS:
 # Cliente Telegram
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 
+
+# -----------------------------
+# Notificação Push
+# -----------------------------
 async def send_notification_push(html_texto: str):
     try:
         r = requests.post(
@@ -43,10 +46,15 @@ async def send_notification_push(html_texto: str):
     except Exception as e:
         logger.error(f"Erro ao enviar push: {e}")
 
+
+# -----------------------------
+# Processamento de mensagens
+# -----------------------------
 async def process_message(event):
     if event.out:
         return
 
+    # Evita loop com seu próprio bot
     try:
         sender = await event.get_sender()
         if getattr(sender, "username", "").lower() == "rjesus99_bot":
@@ -87,13 +95,16 @@ async def process_message(event):
                 f"{msg_original[:200]}..."
             )
 
+            # Envia para Saved Messages
             try:
                 await client.send_message("me", alerta_html, parse_mode="html")
             except Exception as e:
                 logger.error(f"Erro ao enviar para Saved Messages: {e}")
 
+            # Push Notification
             await send_notification_push(alerta_html)
             break
+
 
 @client.on(events.NewMessage)
 async def handler(event):
@@ -104,7 +115,10 @@ async def handler(event):
     except Exception as e:
         logger.error(f"Erro no handler: {e}")
 
-# Comandos
+
+# -----------------------------
+# Comandos do bot
+# -----------------------------
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     await event.reply("Monitorando termos: " + ", ".join(TERMOS))
@@ -155,6 +169,10 @@ async def reset_handler(event):
     TERMOS = load_terms()
     await event.reply("Termos resetados.")
 
+
+# -----------------------------
+# Main
+# -----------------------------
 async def main():
     try:
         await client.connect()
@@ -169,6 +187,7 @@ async def main():
 
     except Exception as e:
         logger.error(f"Erro no main: {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
