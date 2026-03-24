@@ -9,9 +9,19 @@ app = FastAPI(title="Telegram Bot Server")
 def read_root():
     return {"status": "running", "message": "Userbot ativo no Hugging Face"}
 
+@app.head("/")
+def read_root_head():
+    # HEAD não deve retornar corpo, apenas status 200
+    return {}
+
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+@app.head("/health")
+def health_head():
+    # HEAD retorna apenas cabeçalhos e status 200
+    return {}
 
 def run_server():
     """Executa o servidor FastAPI em uma thread separada"""
