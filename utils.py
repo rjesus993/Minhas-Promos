@@ -54,6 +54,20 @@ def contains_term(text: str, term: str, use_fuzzy: bool = False) -> bool:
 
     return False
 
+import re
+
+def extract_price(text: str):
+    """
+    Detecta preços no formato brasileiro:
+    R$ 129,90
+    129,90
+    129
+    """
+    pattern = r"(r\$ ?\d{1,4}(?:[\.,]\d{2})?)|\b\d{1,4}(?:[\.,]\d{2})\b"
+    match = re.search(pattern, text.lower())
+    if match:
+        return match.group(0).replace(" ", "")
+    return None
 
 def save_terms_to_db(terms: List[str]) -> bool:
     try:
