@@ -1,48 +1,36 @@
 # bot.py
-import os
 import asyncio
 import logging
 import requests
 import time
+import os
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
-from config import API_ID, API_HASH, PHONE_NUMBER, BOT_TOKEN, DESTINO_ID
-from utils import normalize, contains_term, save_terms_to_db, load_terms_from_db
+from config import API_ID, API_HASH, SESSION
+from utils import normalize, contains_term, load_terms_from_db
 from db import save_terms, load_terms, add_term, remove_term
 from server import start_server
 
+# Logging
 logger = logging.getLogger(__name__)
 
-# -----------------------------
-# Carrega sessão do Hugging Face
-# -----------------------------
-SESSION = os.getenv("TELEGRAM_SESSION")
-if not SESSION:
-    raise RuntimeError("❌ TELEGRAM_SESSION não encontrada nos secrets!")
-
-client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-
-# -----------------------------
 # Cache de mensagens
-# -----------------------------
-mensagens_processadas = {}  # msg_id: timestamp
+mensagens_processadas = {}
 CACHE_TTL = 30 * 60  # 30 minutos
 
-# -----------------------------
 # Carrega termos
-# -----------------------------
 TERMOS = load_terms_from_db()
 if not TERMOS:
     from config import TERMOS_ENV
     TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
     save_terms(TERMOS)
 
-# -----------------------------
-# Função de push notification
-# -----------------------------
+# Cliente Telegram
+client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+
 async def send_notification_push(html_texto: str):
     try:
         r = requests.post(
@@ -55,11 +43,7 @@ async def send_notification_push(html_texto: str):
     except Exception as e:
         logger.error(f"Erro ao enviar push: {e}")
 
-# -----------------------------
-# Processamento de mensagens
-# -----------------------------
 async def process_message(event):
-
     if event.out:
         return
 
@@ -70,11 +54,10 @@ async def process_message(event):
     except:
         pass
 
-    # Cache
     now = time.time()
     mensagens_processadas[event.id] = now
 
-    # Limpa cache antigo
+    # Limpa cache
     for msg_id, ts in list(mensagens_processadas.items()):
         if now - ts > CACHE_TTL:
             mensagens_processadas.pop(msg_id, None)
@@ -85,7 +68,6 @@ async def process_message(event):
 
     chat = await event.get_chat()
     chat_title = getattr(chat, "title", "Chat Privado")
-
     msg_limpa = normalize(msg_original)
 
     for termo in TERMOS:
@@ -113,9 +95,6 @@ async def process_message(event):
             await send_notification_push(alerta_html)
             break
 
-# -----------------------------
-# Handlers
-# -----------------------------
 @client.on(events.NewMessage)
 async def handler(event):
     try:
@@ -125,6 +104,7 @@ async def handler(event):
     except Exception as e:
         logger.error(f"Erro no handler: {e}")
 
+# Comandos
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     await event.reply("Monitorando termos: " + ", ".join(TERMOS))
@@ -139,8 +119,7 @@ async def list_termos_handler(event):
 @client.on(events.NewMessage(pattern='/settermos'))
 async def set_termos_handler(event):
     try:
-        text = event.message.message
-        novos = [t.strip() for t in text[10:].split(",") if t.strip()]
+        novos = [t.strip() for t in event.message.message[10:].split(",") if t.strip()]
         if novos:
             global TERMOS
             TERMOS = novos
@@ -176,15 +155,13 @@ async def reset_handler(event):
     TERMOS = load_terms()
     await event.reply("Termos resetados.")
 
-# -----------------------------
-# MAIN
-# -----------------------------
 async def main():
     try:
         await client.connect()
         logger.info("Userbot conectado com sucesso!")
 
-        asyncio.create_task(start_server())
+        # Inicia o servidor em thread separada
+        start_server()
 
         await send_notification_push("<b>Bot iniciado no Hugging Face</b>")
 
