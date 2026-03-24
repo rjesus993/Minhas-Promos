@@ -20,20 +20,34 @@ def normalize(text: str) -> str:
 
 def contains_term(text: str, term: str, use_fuzzy: bool = False) -> bool:
     """
-    Verifica se o termo aparece no texto.
-    Pode usar regex ou comparação aproximada (fuzzy).
+    Verifica se TODAS as palavras do termo aparecem no texto,
+    mesmo separadas e em qualquer ordem.
+
+    Exemplo:
+    termo = "cupom amazon"
+    texto = "resgate o cupom do anúncio... link da amazon"
+    → True
     """
+
     text_norm = normalize(text)
     term_norm = normalize(term)
 
-    # Busca direta com regex
+    # Divide o termo em palavras
+    palavras = term_norm.split()
+
+    # Verifica se TODAS as palavras aparecem no texto
+    if all(p in text_norm for p in palavras):
+        return True
+
+    # Regex opcional (para permitir variações maiores)
     try:
-        if re.search(re.escape(term_norm), text_norm):
+        pattern = r".*".join(map(re.escape, palavras))
+        if re.search(pattern, text_norm):
             return True
     except re.error:
         pass
 
-    # Busca aproximada
+    # Fuzzy opcional
     if use_fuzzy:
         ratio = difflib.SequenceMatcher(None, term_norm, text_norm).ratio()
         return ratio > 0.8
@@ -42,9 +56,6 @@ def contains_term(text: str, term: str, use_fuzzy: bool = False) -> bool:
 
 
 def save_terms_to_db(terms: List[str]) -> bool:
-    """
-    Salva lista de termos no banco (Supabase).
-    """
     try:
         from db import save_terms
         save_terms(terms)
@@ -55,9 +66,6 @@ def save_terms_to_db(terms: List[str]) -> bool:
 
 
 def load_terms_from_db() -> List[str]:
-    """
-    Carrega lista de termos do banco (Supabase).
-    """
     try:
         from db import load_terms
         return load_terms()
