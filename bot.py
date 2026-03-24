@@ -10,7 +10,7 @@ from telethon.sessions import StringSession
 
 from config import API_ID, API_HASH, SESSION, PHONE_NUMBER
 from utils import normalize, contains_term
-from db import save_terms, load_terms, add_term, remove_term, load_terms_from_db
+from db import save_terms, load_terms, add_term, remove_term
 from server import start_server
 
 # Logging
@@ -21,7 +21,7 @@ mensagens_processadas = {}
 CACHE_TTL = 30 * 60  # 30 minutos
 
 # Carrega termos
-TERMOS = load_terms_from_db()
+TERMOS = load_terms()
 if not TERMOS:
     from config import TERMOS_ENV
     TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
@@ -31,9 +31,6 @@ if not TERMOS:
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 
 
-# -----------------------------
-# Notificação Push
-# -----------------------------
 async def send_notification_push(html_texto: str):
     try:
         r = requests.post(
@@ -47,14 +44,10 @@ async def send_notification_push(html_texto: str):
         logger.error(f"Erro ao enviar push: {e}")
 
 
-# -----------------------------
-# Processamento de mensagens
-# -----------------------------
 async def process_message(event):
     if event.out:
         return
 
-    # Evita loop com seu próprio bot
     try:
         sender = await event.get_sender()
         if getattr(sender, "username", "").lower() == "rjesus99_bot":
@@ -65,7 +58,6 @@ async def process_message(event):
     now = time.time()
     mensagens_processadas[event.id] = now
 
-    # Limpa cache
     for msg_id, ts in list(mensagens_processadas.items()):
         if now - ts > CACHE_TTL:
             mensagens_processadas.pop(msg_id, None)
@@ -95,13 +87,11 @@ async def process_message(event):
                 f"{msg_original[:200]}..."
             )
 
-            # Envia para Saved Messages
             try:
                 await client.send_message("me", alerta_html, parse_mode="html")
             except Exception as e:
                 logger.error(f"Erro ao enviar para Saved Messages: {e}")
 
-            # Push Notification
             await send_notification_push(alerta_html)
             break
 
@@ -116,12 +106,10 @@ async def handler(event):
         logger.error(f"Erro no handler: {e}")
 
 
-# -----------------------------
-# Comandos do bot
-# -----------------------------
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     await event.reply("Monitorando termos: " + ", ".join(TERMOS))
+
 
 @client.on(events.NewMessage(pattern='/termos'))
 async def list_termos_handler(event):
@@ -129,6 +117,7 @@ async def list_termos_handler(event):
         await event.reply("Nenhum termo configurado.")
     else:
         await event.reply("Termos atuais:\n" + "\n".join(f"• {t}" for t in TERMOS))
+
 
 @client.on(events.NewMessage(pattern='/settermos'))
 async def set_termos_handler(event):
@@ -142,6 +131,7 @@ async def set_termos_handler(event):
     except Exception as e:
         logger.error(e)
 
+
 @client.on(events.NewMessage(pattern='/addtermo'))
 async def add_termo_handler(event):
     termo = event.message.message[9:].strip()
@@ -152,16 +142,18 @@ async def add_termo_handler(event):
         else:
             await event.reply("Erro ao adicionar termo.")
 
+
 @client.on(events.NewMessage(pattern='/deltermo'))
 async def del_termo_handler(event):
     termo = event.message.message[9:].strip()
     if termo:
         if remove_term(termo):
             global TERMOS
-            TERMOS = load_terms_from_db()
+            TERMOS = load_terms()
             await event.reply(f"Termo '{termo}' removido.")
         else:
             await event.reply("Erro ao remover termo.")
+
 
 @client.on(events.NewMessage(pattern='/reset'))
 async def reset_handler(event):
@@ -170,15 +162,11 @@ async def reset_handler(event):
     await event.reply("Termos resetados.")
 
 
-# -----------------------------
-# Main
-# -----------------------------
 async def main():
     try:
         await client.connect()
         logger.info("Userbot conectado com sucesso!")
 
-        # Inicia o servidor em thread separada
         start_server()
 
         await send_notification_push("<b>Bot iniciado no Hugging Face</b>")
