@@ -84,18 +84,19 @@ preco = extract_price(msg_original)
 preco_formatado = preco if preco else "Não identificado"
 
 alerta_html = (
-    "<b>🔥 OFERTA DETECTADA!</b>\n\n"
-    f"<b>🧩 Termo:</b> <code>{termo}</code>\n"
-    f"<b>💬 Grupo:</b> {chat_title}\n"
-    f"<b>🔗 Link:</b> {msg_link}\n\n"
+                "<b>🔥 OFERTA DETECTADA!</b>\n\n"
+                f"<b>🧩 Termo:</b> <code>{termo}</code>\n"
+                f"<b>💬 Grupo:</b> {chat_title}\n"
+                f"<b>🔗 Link:</b> {msg_link}\n\n"
 
-    "<b>📦 Produto:</b>\n"
-    "━━━━━━━━━━━━━━━━━━\n"
-    f"<b>💰 Preço:</b> {preco_formatado}\n"
-    f"<b>📝 Descrição:</b>\n"
-    f"{msg_original[:500]}\n"
-    "━━━━━━━━━━━━━━━━━━"
-)
+                "<b>📦 Produto:</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"<b>💰 Preço:</b> {preco_formatado}\n"
+                f"<b>📝 Descrição:</b>\n"
+                f"{msg_original[:500]}\n"
+                "━━━━━━━━━━━━━━━━━━"
+            )
+
 
             try:
                 await client.send_message("me", alerta_html, parse_mode="html")
