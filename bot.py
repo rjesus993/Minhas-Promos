@@ -9,25 +9,21 @@ from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
 from config import API_ID, API_HASH, SESSION, PHONE_NUMBER
-from utils import normalize, contains_term, extract_price
+from utils import normalize, contains_term, extract_price, extract_product_name
 from db import save_terms, load_terms, add_term, remove_term
 from server import start_server
 
-# Logging
 logger = logging.getLogger(__name__)
 
-# Cache de mensagens
 mensagens_processadas = {}
-CACHE_TTL = 30 * 60  # 30 minutos
+CACHE_TTL = 30 * 60
 
-# Carrega termos
 TERMOS = load_terms()
 if not TERMOS:
     from config import TERMOS_ENV
     TERMOS = [t.strip() for t in TERMOS_ENV.split(",") if t.strip()]
     save_terms(TERMOS)
 
-# Cliente Telegram
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 
 
@@ -78,23 +74,19 @@ async def process_message(event):
             except:
                 msg_link = "Link indisponível"
 
-            # 🔥 DETECÇÃO DE PREÇO
             preco = extract_price(msg_original)
             preco_formatado = preco if preco else "Não identificado"
 
-            # 🎨 MINI-CARD DE PRODUTO
-            alerta_html = (
-                "<b>🔥 OFERTA DETECTADA!</b>\n\n"
-                f"<b>🧩 Termo:</b> <code>{termo}</code>\n"
-                f"<b>💬 Grupo:</b> {chat_title}\n"
-                f"<b>🔗 Link:</b> {msg_link}\n\n"
+            produto = extract_product_name(msg_original)
 
-                "<b>📦 Produto:</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n"
+            alerta_html = (
+                "<b>🔥 Oferta encontrada!</b>\n\n"
+                f"<b>🧩 Termo:</b> <code>{termo}</code>\n"
                 f"<b>💰 Preço:</b> {preco_formatado}\n"
-                f"<b>📝 Descrição:</b>\n"
-                f"{msg_original[:500]}\n"
-                "━━━━━━━━━━━━━━━━━━"
+                f"<b>📦 Produto:</b> {produto}\n"
+                f"<b>🔗 Link:</b> {msg_link}\n\n"
+                "<b>📝</b>\n"
+                f"{msg_original[:400]}"
             )
 
             try:
