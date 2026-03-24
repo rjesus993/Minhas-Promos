@@ -9,7 +9,7 @@ from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
 from config import API_ID, API_HASH, SESSION, PHONE_NUMBER
-from utils import normalize, contains_term
+from utils import normalize, contains_term, extract_price
 from db import save_terms, load_terms, add_term, remove_term
 from server import start_server
 
@@ -78,12 +78,12 @@ async def process_message(event):
             except:
                 msg_link = "Link indisponível"
 
-            from utils import extract_price
+            # 🔥 DETECÇÃO DE PREÇO
+            preco = extract_price(msg_original)
+            preco_formatado = preco if preco else "Não identificado"
 
-preco = extract_price(msg_original)
-preco_formatado = preco if preco else "Não identificado"
-
-alerta_html = (
+            # 🎨 MINI-CARD DE PRODUTO
+            alerta_html = (
                 "<b>🔥 OFERTA DETECTADA!</b>\n\n"
                 f"<b>🧩 Termo:</b> <code>{termo}</code>\n"
                 f"<b>💬 Grupo:</b> {chat_title}\n"
@@ -96,7 +96,6 @@ alerta_html = (
                 f"{msg_original[:500]}\n"
                 "━━━━━━━━━━━━━━━━━━"
             )
-
 
             try:
                 await client.send_message("me", alerta_html, parse_mode="html")
