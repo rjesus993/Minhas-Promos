@@ -1,8 +1,7 @@
 # server.py
 from fastapi import FastAPI
-import asyncio
 import threading
-from typing import Dict, Any
+import uvicorn
 
 app = FastAPI(title="Telegram Bot Server")
 
@@ -14,14 +13,16 @@ def read_root():
 def health_check():
     return {"status": "healthy"}
 
-async def start_server():
-    """Inicia o servidor FastAPI"""
-    import uvicorn
-    from fastapi import FastAPI
-    
-    # Configuração do servidor
-    config = uvicorn.Config(app, host="0.0.0.0", port=7860, log_level="info")
-    server = uvicorn.Server(config)
-    
-    # Inicia o servidor
-    await server.serve()
+def run_server():
+    """Executa o servidor FastAPI em uma thread separada"""
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=7860,
+        log_level="info"
+    )
+
+def start_server():
+    """Inicia o servidor em background sem bloquear o bot"""
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
