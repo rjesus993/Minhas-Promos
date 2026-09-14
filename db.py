@@ -64,7 +64,6 @@ class SQLiteDatabase:
             check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
-        # Apply pragmas on every connection (persistent for WAL; others are per-connection)
         pragmas = [
             f"PRAGMA busy_timeout = {self._busy_timeout_ms}",
             f"PRAGMA foreign_keys = {'ON' if self._foreign_keys else 'OFF'}",
@@ -81,7 +80,6 @@ class SQLiteDatabase:
     def close(self) -> None:
         if self._conn is not None:
             try:
-                # Final WAL checkpoint before close
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception:
                 pass
@@ -132,7 +130,6 @@ class SQLiteDatabase:
         for version, filepath in files:
             if version in applied:
                 continue
-            # Pre-migration backup if any data exists and this is not first migration
             if backup_before_migration and applied:
                 try:
                     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -213,17 +210,11 @@ class SQLiteDatabase:
                 self._conn.commit()
             return True
         except sqlite3.IntegrityError:
-            # Term already exists; log and return False (matches old supabase behavior which
-            # also would fail uniqueness but Supabase didn't enforce)
             logger.warning("add_term duplicate: %s", t_clean)
             try:
                 self._conn.rollback()
             except Exception:
                 pass
-            # Be lenient: if term exists, just record history and return true?
-            # Preserve original semantics: return False on error, and original code
-            # never checked for uniqueness in `terms` table.
-            # Insert history row separately (outside transaction)
             try:
                 self._conn.execute(
                     "INSERT INTO term_history (term, action) VALUES (?, 'added')",
@@ -278,6 +269,143 @@ class SQLiteDatabase:
         except Exception as e:
             logger.error("get_term_history failed: %s", e)
             return []
+
+    # ----- Source Chats (Fase 3) -----
+    def list_source_chats(self) -> List[Dict[str, Any]]:
+        """Retorna todas as entradas de source_chats."""
+        try:
+            rows = self._conn.execute(
+                "SELECT chat_id, title, mode, added_at FROM source_chats "
+                "ORDER BY mode ASC, title ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error("list_source_chats failed: %s", e)
+            return []
+
+    def source_chats_mode(self) -> str:
+        """Retorna 'allow' se houver qualquer entrada com mode='allow',
+        senão 'deny' se só houver 'deny', senão 'all' (tabela vazia)."""
+        try:
+            rows = self._conn.execute(
+                "SELECT DISTINCT mode FROM source_chats"
+            ).fetchall()
+            modes = {r["mode"] for r in rows}
+            if "allow" in modes:
+                return "allow"
+            if "deny" in modes:
+                return "deny"
+            return "all"
+        except Exception:
+            return "all"
+
+    def add_source_chat(self, chat_id: int, title: str = "", mode: str = "allow") -> bool:
+        """Adiciona ou atualiza um chat na whitelist/blacklist."""
+        if mode not in ("allow", "deny"):
+            logger.error("add_source_chat: mode inválido %r", mode)
+            return False
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO source_chats (chat_id, title, mode) VALUES (?, ?, ?) "
+                    "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, mode=excluded.mode",
+                    (int(chat_id), str(title)[:200], mode),
+                )
+            return True
+        except Exception as e:
+            logger.error("add_source_chat failed: %s", e)
+            return False
+
+    def remove_source_chat(self, chat_id: int) -> bool:
+        """Remove um chat da whitelist/blacklist."""
+        try:
+            with self._conn:
+                cur = self._conn.execute(
+                    "DELETE FROM source_chats WHERE chat_id = ?",
+                    (int(chat_id),),
+                )
+                return cur.rowcount > 0
+        except Exception as e:
+            logger.error("remove_source_chat failed: %s", e)
+            return False
+
+    def clear_source_chats(self) -> int:
+        """Limpa a tabela. Retorna quantas linhas foram removidas."""
+        try:
+            with self._conn:
+                cur = self._conn.execute("DELETE FROM source_chats")
+                return cur.rowcount
+        except Exception as e:
+            logger.error("clear_source_chats failed: %s", e)
+            return 0
+
+    def is_chat_allowed(self, chat_id: int) -> bool:
+        """Decide se um chat deve ser monitorado, respeitando o mode atual."""
+        mode = self.source_chats_mode()
+        if mode == "all":
+            return True
+        try:
+            row = self._conn.execute(
+                "SELECT 1 FROM source_chats WHERE chat_id = ? AND mode = ? LIMIT 1",
+                (int(chat_id), mode),
+            ).fetchone()
+            if mode == "allow":
+                return row is not None
+            else:
+                return row is None
+        except Exception as e:
+            logger.error("is_chat_allowed failed: %s", e)
+            return True
+
+    # ----- Deduplicação (Fase 4) -----
+    def was_hash_seen(self, h: str, window_seconds: int = 1800) -> bool:
+        """Retorna True se o hash foi visto nos últimos N segundos."""
+        try:
+            row = self._conn.execute(
+                "SELECT last_seen FROM seen_hashes WHERE hash = ?",
+                (str(h),),
+            ).fetchone()
+            if not row:
+                return False
+            last_seen = row["last_seen"]
+            try:
+                dt = datetime.datetime.fromisoformat(
+                    str(last_seen).replace("Z", "+00:00")
+                )
+                delta = (datetime.datetime.utcnow() - dt.replace(tzinfo=None)).total_seconds()
+                return delta < window_seconds
+            except Exception:
+                return False
+        except Exception as e:
+            logger.error("was_hash_seen failed: %s", e)
+            return False
+
+    def remember_hash(self, h: str, term: str = "") -> None:
+        """Grava (ou atualiza) o hash na tabela seen_hashes."""
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO seen_hashes (hash, term) VALUES (?, ?) "
+                    "ON CONFLICT(hash) DO UPDATE SET "
+                    "last_seen = CURRENT_TIMESTAMP, "
+                    "hit_count = hit_count + 1",
+                    (str(h), str(term)[:200]),
+                )
+        except Exception as e:
+            logger.error("remember_hash failed: %s", e)
+
+    def purge_seen_hashes(self, older_than_seconds: int = 86400) -> int:
+        """Remove hashes mais antigos que N segundos. Retorna contagem."""
+        try:
+            with self._conn:
+                cur = self._conn.execute(
+                    f"DELETE FROM seen_hashes WHERE "
+                    f"last_seen < datetime(CURRENT_TIMESTAMP, '-{int(older_than_seconds)} seconds')"
+                )
+                return cur.rowcount
+        except Exception as e:
+            logger.error("purge_seen_hashes failed: %s", e)
+            return 0
 
     # ----- Push Queue Support -----
     def enqueue_push(self, html: str) -> int:
@@ -334,9 +462,6 @@ class SQLiteDatabase:
             logger.error("mark_push_success failed: %s", e)
 
     def mark_push_failure(self, push_id: int, error: str, backoff_seconds: int, max_retries: int = 20) -> bool:
-        """Return True if kept for retry, False if dropped (exceeded retries).
-        backoff_seconds: integer seconds added to CURRENT_TIMESTAMP for next attempt.
-        """
         try:
             with self._conn:
                 row = self._conn.execute(
@@ -403,7 +528,6 @@ class SQLiteDatabase:
         dest_abs = _coerce_path(dest_path)
         if compress and not dest_abs.endswith(".gz"):
             dest_abs = dest_abs + ".gz"
-        # For uncompressed use sqlite3 backup API; for compressed we write temp then gz
         tmp_uncompressed = dest_abs
         if compress:
             tmp_uncompressed = dest_abs[:-3] + ".tmp"
@@ -436,7 +560,6 @@ class SQLiteDatabase:
                 if not ok:
                     raise RuntimeError(f"Backup integrity_check != ok on {actual_final}")
             except Exception:
-                # Retry once
                 logger.warning("First backup verify failed, retrying once...")
                 try:
                     if os.path.exists(actual_final):
@@ -476,7 +599,6 @@ class SQLiteDatabase:
 
     @classmethod
     def restore_from_backup(cls, backup_path: str, dest_db_path: str, safety_copy: bool = True) -> str:
-        """Static: copy backup over dest_db_path. Returns the safety copy path if made."""
         dest_abs = _coerce_path(dest_db_path)
         safety_path = None
         if safety_copy and os.path.exists(dest_abs):
@@ -504,14 +626,12 @@ class SQLiteDatabase:
                     shutil.copyfileobj(f_in, f_out)
         else:
             shutil.copy2(backup_path, tmp_path)
-        # Final atomic move (best-effort)
         if os.path.exists(dest_abs):
             try:
                 os.remove(dest_abs)
             except Exception:
                 pass
         os.replace(tmp_path, dest_abs)
-        # Cleanup leftover wal/shm from previous instance to avoid confusion
         for ext in ("-wal", "-shm", "-journal"):
             p = dest_abs + ext
             if os.path.exists(p):
@@ -523,8 +643,7 @@ class SQLiteDatabase:
 
 
 # -----------------------------------------------------------------------------
-# Module-level singleton interface (preserves original import-call semantics for
-# bot.py and utils.py which called save_terms(...) / load_terms(...) directly).
+# Module-level singleton interface
 # -----------------------------------------------------------------------------
 _db_singleton: Optional[SQLiteDatabase] = None
 
@@ -535,7 +654,6 @@ def _get_default_db_path() -> str:
         cfg = load_config()
         return cfg.db_path
     except Exception:
-        # config not yet initialized or env missing; fallback
         return os.environ.get("DB_PATH", DEFAULT_DB_PATH)
 
 
@@ -559,7 +677,6 @@ def get_db() -> SQLiteDatabase:
 
 
 def reset_db_singleton() -> None:
-    """Used by tests to force reinit."""
     global _db_singleton
     if _db_singleton is not None:
         try:
@@ -569,7 +686,7 @@ def reset_db_singleton() -> None:
     _db_singleton = None
 
 
-# ----- Original-style module-level functions (for backward compatibility) -----
+# ----- Original-style module-level functions -----
 
 def save_terms(terms: List[str]) -> bool:
     return get_db().save_terms(terms)
@@ -589,3 +706,58 @@ def remove_term(term: str) -> bool:
 
 def get_term_history(limit: int = 50):
     return get_db().get_term_history(limit)
+
+
+def ensure_schema(backup_before_migration: bool = True) -> List[int]:
+    """Module-level wrapper: ensure schema is applied on the singleton DB."""
+    return get_db().ensure_schema(backup_before_migration=backup_before_migration)
+
+
+def health() -> Dict[str, Any]:
+    """Module-level wrapper for health check."""
+    return get_db().health()
+
+
+def terms_count() -> int:
+    """Module-level wrapper for terms count."""
+    return get_db().terms_count()
+
+
+# ----- Source Chats (Fase 3) — wrappers de módulo -----
+
+def list_source_chats() -> List[Dict[str, Any]]:
+    return get_db().list_source_chats()
+
+
+def source_chats_mode() -> str:
+    return get_db().source_chats_mode()
+
+
+def add_source_chat(chat_id: int, title: str = "", mode: str = "allow") -> bool:
+    return get_db().add_source_chat(chat_id, title, mode)
+
+
+def remove_source_chat(chat_id: int) -> bool:
+    return get_db().remove_source_chat(chat_id)
+
+
+def clear_source_chats() -> int:
+    return get_db().clear_source_chats()
+
+
+def is_chat_allowed(chat_id: int) -> bool:
+    return get_db().is_chat_allowed(chat_id)
+
+
+# ----- Deduplicação (Fase 4) — wrappers de módulo -----
+
+def was_hash_seen(h: str, window_seconds: int = 1800) -> bool:
+    return get_db().was_hash_seen(h, window_seconds)
+
+
+def remember_hash(h: str, term: str = "") -> None:
+    get_db().remember_hash(h, term)
+
+
+def purge_seen_hashes(older_than_seconds: int = 86400) -> int:
+    return get_db().purge_seen_hashes(older_than_seconds)

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Main entry point for Minhas Promo: orchestrates bot, FastAPI server, push queue, and backup scheduler with graceful shutdown and crash restart."""
+"""Main entry point for Minhas Promo: orchestrates bot, FastAPI server,
+push queue, and backup scheduler with graceful shutdown, crash restart,
+and bot-task supervision."""
 
 import asyncio
 import logging
@@ -18,6 +20,65 @@ from logging_config import setup_logging
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# SUPERVISOR DO BOT
+# ============================================================================
+async def supervised_bot_runner(
+    max_backoff: int = 300,
+    initial_backoff: int = 5,
+) -> None:
+    """
+    Roda bot.main() em loop. Sempre que cair (por erro OU por retorno
+    silencioso), reinicia com backoff exponencial.
+
+    - max_backoff: teto do backoff em segundos
+    - initial_backoff: backoff inicial em segundos
+    """
+    from bot import main as bot_main_coro
+
+    backoff = initial_backoff
+    tentativa = 0
+
+    while True:
+        tentativa += 1
+        logger.info(f"[SUPERVISOR] Iniciando bot (tentativa #{tentativa})...")
+        started_at = time.time()
+
+        try:
+            await bot_main_coro()
+            # Se bot.main() retornar sem exceção, consideramos queda silenciosa
+            uptime = time.time() - started_at
+            logger.warning(
+                f"[SUPERVISOR] bot.main() retornou sem exceção "
+                f"(uptime={uptime:.1f}s). Reiniciando..."
+            )
+        except asyncio.CancelledError:
+            logger.info("[SUPERVISOR] Cancelado. Encerrando supervisor.")
+            raise
+        except Exception as e:
+            uptime = time.time() - started_at
+            logger.exception(
+                f"[SUPERVISOR] bot.main() crashou após {uptime:.1f}s: {e}"
+            )
+
+        # Se ficou de pé por bastante tempo, reseta o backoff
+        if time.time() - started_at > 60:
+            backoff = initial_backoff
+            logger.info("[SUPERVISOR] Uptime > 60s, backoff resetado.")
+
+        logger.info(f"[SUPERVISOR] Aguardando {backoff}s antes de reiniciar...")
+        try:
+            await asyncio.sleep(backoff)
+        except asyncio.CancelledError:
+            logger.info("[SUPERVISOR] Cancelado durante sleep. Encerrando.")
+            raise
+
+        backoff = min(backoff * 2, max_backoff)
+
+
+# ============================================================================
+# SIGNAL HANDLERS
+# ============================================================================
 def _register_signal_handlers() -> None:
     def _handle_signal(signum: int, frame: Any) -> None:
         logger.info(f'Received signal {signum}, initiating graceful shutdown...')
@@ -30,6 +91,9 @@ def _register_signal_handlers() -> None:
         signal.signal(sig, lambda s, f: _handle_signal(s, f))
 
 
+# ============================================================================
+# BACKUP SCHEDULER
+# ============================================================================
 async def _backup_scheduler(db, cfg) -> None:
     interval = max(60, int(cfg.backup_interval_seconds))
     retention = max(1, int(cfg.backup_retention))
@@ -55,6 +119,9 @@ async def _backup_scheduler(db, cfg) -> None:
             await asyncio.sleep(60)
 
 
+# ============================================================================
+# RUN MAIN
+# ============================================================================
 async def run_main() -> None:
     cfg = load_config()
     setup_logging()
@@ -78,19 +145,44 @@ async def run_main() -> None:
         else:
             logger.error('Auto-restore disabled. Database corruption not recovered.')
             sys.exit(1)
+
     try:
         from push_queue import enqueue_push_html
         enqueue_push_html('<b>Bot iniciado no dispositivo Android</b>', optimistic=True)
     except Exception as e:
         logger.warning(f'Failed to enqueue startup push: {e}')
-    bot_task = asyncio.create_task(bot_main_within_gather(), name='bot')
-    server_task = asyncio.create_task(start_server_async(host=cfg.server_host, port=cfg.server_port, health_token=cfg.health_token), name='server')
-    push_task = asyncio.create_task(push_queue_loop_async(interval_s=60), name='push_queue')
+
+    # ------------------------------------------------------------------
+    # Tasks supervisionadas
+    # ------------------------------------------------------------------
+    bot_task = asyncio.create_task(supervised_bot_runner(), name='bot')
+    server_task = asyncio.create_task(
+        start_server_async(
+            host=cfg.server_host,
+            port=cfg.server_port,
+            health_token=cfg.health_token,
+        ),
+        name='server',
+    )
+    push_task = asyncio.create_task(
+        push_queue_loop_async(interval_s=60), name='push_queue'
+    )
     backup_task = asyncio.create_task(_backup_scheduler(db, cfg), name='backup_scheduler')
-    results = await asyncio.gather(bot_task, server_task, push_task, backup_task, return_exceptions=True)
-    for task, result in zip([bot_task, server_task, push_task, backup_task], results):
+
+    results = await asyncio.gather(
+        bot_task, server_task, push_task, backup_task,
+        return_exceptions=True,
+    )
+
+    for task, result in zip(
+        [bot_task, server_task, push_task, backup_task], results
+    ):
         if isinstance(result, Exception):
-            logger.error(f'Task {task.get_name()} failed: {result}', exc_info=result)
+            logger.error(
+                f'Task {task.get_name()} failed: {result}',
+                exc_info=result,
+            )
+
     logger.info('Cleaning up resources...')
     try:
         db.close()
@@ -99,11 +191,9 @@ async def run_main() -> None:
     logger.info('Shutdown complete.')
 
 
-async def bot_main_within_gather() -> None:
-    from bot import main as bot_main_coro
-    await bot_main_coro()
-
-
+# ============================================================================
+# MAIN
+# ============================================================================
 async def main() -> None:
     _register_signal_handlers()
     try:
