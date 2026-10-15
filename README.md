@@ -9,3 +9,6 @@ license: mit
 ---
 
 Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+
+.\.venv312\Scripts\Activate.ps1
+python main.py

@@ -13,6 +13,7 @@ from telethon.tl.types import User, Chat, Channel
 
 from config import API_ID, API_HASH, SESSION, PHONE_NUMBER
 from utils import normalize, contains_term, extract_price, extract_product_name
+from matcher import smart_match, format_debug
 from db import (
     save_terms, load_terms, add_term, remove_term, get_term_history, get_db,
     list_source_chats, source_chats_mode, add_source_chat, remove_source_chat,
@@ -368,8 +369,21 @@ async def process_message(event):
         logger.info("[CHECK] TERMOS=%s | msg=%r", TERMOS, msg_limpa[:100])
 
     for termo in TERMOS:
-        if not contains_term(msg_limpa, termo):
-            continue
+        # 1) tentativa exata — comportamento original preservado
+        exact_match = contains_term(msg_limpa, termo)
+        smart_result = None
+
+        # 2) smart matching só entra se o exato falhou
+        if not exact_match:
+            smart_result = smart_match(msg_limpa, termo, debug=DEBUG)
+            if not smart_result["matched"]:
+                if DEBUG:
+                    logger.info(
+                        "[SMART MATCH] termo='%s' score=%d resultado=NO_MATCH",
+                        termo, smart_result["score"],
+                    )
+                continue
+
         if not _deve_notificar(termo):
             continue
 
@@ -399,7 +413,16 @@ async def process_message(event):
             f"{preview}"
         )
 
-        logger.info("[MATCH] '%s' em '%s'", termo, chat_title)
+        if exact_match:
+            logger.info("[MATCH] '%s' em '%s'", termo, chat_title)
+        else:
+            logger.info(
+                "[SMART MATCH] termo='%s' score=%d resultado=MATCH tipo=%s",
+                termo, smart_result["score"], smart_result["match_type"],
+            )
+            if DEBUG:
+                logger.info("\n%s", format_debug(termo, msg_original, smart_result))
+
         enviado = await _enviar_notificacao(alerta_html)
 
         if enviado:
