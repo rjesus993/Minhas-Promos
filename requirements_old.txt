@@ -1,6 +1,0 @@
-python-telegram-bot
-Telethon
-python-dotenv
-fastapi
-uvicorn
-requests
