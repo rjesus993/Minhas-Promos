@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from config import load_config
-from db import get_db, reset_db_singleton, ensure_schema
+from db import SQLiteDatabase, get_db, reset_db_singleton
 from server import start_server_async
-from push_queue import push_queue_loop_async, _ensure_config as _pq_cfg
+from push_queue import push_queue_loop_async
 from logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -73,69 +73,112 @@ async def supervised(
 
 
 # ============================================================================
-# BACKUP SCHEDULER
+# BACKUPS
 # ============================================================================
+def _list_backups(backup_dir) -> list:
+    """Só os backups periódicos (backup_*.db), do mais antigo ao mais novo.
+    Não mistura com pre-migration-*.db nem com outros .db da pasta."""
+    return sorted(Path(backup_dir).glob("backup_*.db"), key=lambda p: p.stat().st_mtime)
+
+
 async def _backup_scheduler(db, cfg) -> None:
     interval = max(60, int(cfg.backup_interval_seconds))
     retention = max(1, int(cfg.backup_retention))
     while True:
         try:
-            await asyncio.sleep(interval)
-            timestamp = int(time.time())
-            dest = str(Path(cfg.backup_dir) / f'backup_{timestamp}.db')
-            backup_path = db.backup(dest_path=dest, compress=False)
-            logger.info(f'Backup created: {backup_path}')
-            backups = sorted(Path(cfg.backup_dir).rglob('*.db'), key=lambda p: p.stat().st_mtime)
+            # Agenda pelo backup mais recente em disco. Antes dormia `interval`
+            # inteiro a cada start: em host que reinicia mais de 1x/dia
+            # (ex.: Spaces) o primeiro backup nunca acontecia.
+            existing = _list_backups(cfg.backup_dir)
+            if existing:
+                age = time.time() - existing[-1].stat().st_mtime
+                wait = max(0.0, interval - age)
+            else:
+                wait = 0.0
+            if wait:
+                await asyncio.sleep(wait)
+
+            dest = str(Path(cfg.backup_dir) / f"backup_{int(time.time())}.db")
+            # db.backup é síncrono e pode levar segundos: fora do event loop.
+            backup_path = await asyncio.to_thread(db.backup, dest_path=dest, compress=False)
+            logger.info(f"Backup created: {backup_path}")
+
+            backups = _list_backups(cfg.backup_dir)
             while len(backups) > retention:
                 oldest = backups.pop(0)
                 try:
                     oldest.unlink()
-                    logger.info(f'Removed old backup: {oldest}')
+                    logger.info(f"Removed old backup: {oldest}")
                 except Exception as e:
-                    logger.warning(f'Failed to remove old backup {oldest}: {e}')
+                    logger.warning(f"Failed to remove old backup {oldest}: {e}")
         except asyncio.CancelledError:
-            break
+            raise
         except Exception as e:
-            logger.exception(f'Error in backup scheduler: {e}')
+            logger.exception(f"Error in backup scheduler: {e}")
             await asyncio.sleep(60)
+
+
+_CORRUPTION_MARKERS = ("malformed", "not a database", "corrupt")
+
+
+def _looks_like_corruption(exc: BaseException) -> bool:
+    """Corrupção de verdade, não 'database is locked' nem migration quebrada."""
+    for e in (exc, exc.__cause__):
+        if e is not None and any(m in str(e).lower() for m in _CORRUPTION_MARKERS):
+            return True
+    return False
+
+
+def _open_db_or_restore(cfg):
+    """Abre o banco e garante integridade. Se estiver corrompido e
+    AUTO_RESTORE_ON_CORRUPTION=true, tenta os backups do mais novo ao mais
+    antigo. Se nada der certo, encerra com código 1 (nunca segue com banco ruim)."""
+    reason = None
+    try:
+        db = get_db()
+        if db.health().get("integrity_check") == "ok":
+            return db
+        reason = "integrity_check falhou"
+    except Exception as e:
+        if not _looks_like_corruption(e):
+            raise  # erro de migration/permissão etc.: não é motivo para sobrescrever dados
+        reason = f"erro ao abrir: {e}"
+
+    logger.error(f"Banco corrompido ({reason}).")
+    if not cfg.auto_restore_on_corruption:
+        logger.error("Auto-restore desativado (AUTO_RESTORE_ON_CORRUPTION=false). Encerrando.")
+        sys.exit(1)
+
+    reset_db_singleton()  # fecha a conexão antes de trocar o arquivo
+    for candidate in reversed(_list_backups(cfg.backup_dir)):
+        try:
+            safety = SQLiteDatabase.restore_from_backup(
+                str(candidate), cfg.db_path, safety_copy=True
+            )
+            reset_db_singleton()
+            db = get_db()
+            if db.health().get("integrity_check") == "ok":
+                logger.info(f"Banco restaurado de {candidate.name} (cópia do estado anterior: {safety}).")
+                return db
+            logger.error(f"Backup {candidate.name} restaurado mas ainda inválido; tentando o anterior.")
+        except Exception:
+            logger.exception(f"Falha ao restaurar {candidate.name}; tentando o anterior.")
+            reset_db_singleton()
+
+    logger.error("Nenhum backup válido para restaurar. Encerrando.")
+    sys.exit(1)
 
 
 # ============================================================================
 # RUN MAIN
 # ============================================================================
 async def run_main() -> None:
+    setup_logging()          # antes de qualquer log (inclusive avisos do load_config)
     cfg = load_config()
-    setup_logging()
-    db = get_db()
-    ensure_schema()
+    db = _open_db_or_restore(cfg)
 
-    integrity = db.health().get('integrity_check', '')
-    if integrity != 'ok':
-        if cfg.auto_restore_on_corruption:
-            logger.info('Database integrity check failed. Attempting auto-restore...')
-            try:
-                backup_dir = Path(cfg.backup_dir)
-                backups = sorted(
-                    backup_dir.rglob('*.db'),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                if backups:
-                    db.restore_from_backup(str(backups[0]), safety_copy=True)
-                    logger.info('Database restored from backup.')
-                else:
-                    logger.warning('No backup found for restoration.')
-            except Exception as e:
-                logger.error(f'Database restore failed: {e}')
-        else:
-            logger.error('Auto-restore disabled. Database corruption not recovered.')
-            sys.exit(1)
-
-    try:
-        from push_queue import enqueue_push_html
-        enqueue_push_html('<b>Bot iniciado no dispositivo Android</b>', optimistic=True)
-    except Exception as e:
-        logger.warning(f'Failed to enqueue startup push: {e}')
+    # O push "Bot iniciado" é enviado pelo bot.py (uma vez por processo, fora
+    # do event loop). Aqui ele era duplicado e fazia HTTP bloqueante no loop.
 
     # ------------------------------------------------------------------
     # Shutdown coordenado via asyncio.Event
