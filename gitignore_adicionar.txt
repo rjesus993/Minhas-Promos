@@ -1,0 +1,8 @@
+.venv*/
+*.bak
+*.session
+.env
+.env.*
+!.env.example
+data/
+__pycache__/

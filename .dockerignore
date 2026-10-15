@@ -1,8 +1,9 @@
 .git
 .venv*/
 __pycache__/
+*.pyc
 *.bak
-tests/
-data/
-*.db*
+*.session
 .env*
+data/
+tests/
