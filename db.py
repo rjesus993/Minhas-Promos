@@ -7,6 +7,8 @@ Implements migration system, atomic transactions, backup, and health checks.
 
 import os
 import re
+import functools
+import threading
 import glob
 import gzip
 import shutil
@@ -19,6 +21,17 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = os.path.join("data", "minhas_promo.db")
 DEFAULT_MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
+
+
+def _synchronized(fn):
+    """Serializa o acesso à conexão única (compartilhada entre a thread do
+    event loop e threads de executor). Sem isso, transações de threads
+    diferentes se misturam na mesma conexão (commit/rollback cruzados)."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
 
 
 def _coerce_path(path: str) -> str:
@@ -49,10 +62,12 @@ class SQLiteDatabase:
         self._busy_timeout_ms = busy_timeout_ms
         self._synchronous = synchronous.upper()
         self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.RLock()
         self._connect()
         self.ensure_schema()
 
     # ----- Connection Management -----
+    @_synchronized
     def _connect(self) -> None:
         if self._conn is not None:
             try:
@@ -77,6 +92,7 @@ class SQLiteDatabase:
             except Exception as e:
                 logger.warning("Pragma failed (%s): %s", p, e)
 
+    @_synchronized
     def close(self) -> None:
         if self._conn is not None:
             try:
@@ -90,6 +106,7 @@ class SQLiteDatabase:
             self._conn = None
 
     # ----- Migration System -----
+    @_synchronized
     def _applied_migrations(self) -> List[int]:
         try:
             cur = self._conn.execute(
@@ -123,6 +140,7 @@ class SQLiteDatabase:
         out.sort(key=lambda x: x[0])
         return out
 
+    @_synchronized
     def ensure_schema(self, backup_before_migration: bool = True) -> List[int]:
         applied = self._applied_migrations()
         files = self._list_migration_files()
@@ -152,6 +170,7 @@ class SQLiteDatabase:
         return newly_applied
 
     # ----- Core Term Interface -----
+    @_synchronized
     def load_terms(self) -> List[str]:
         try:
             rows = self._conn.execute(
@@ -162,6 +181,7 @@ class SQLiteDatabase:
             logger.error("load_terms failed: %s", e)
             return []
 
+    @_synchronized
     def save_terms(self, terms: List[str]) -> bool:
         try:
             with self._conn:
@@ -192,6 +212,7 @@ class SQLiteDatabase:
                 pass
             return False
 
+    @_synchronized
     def add_term(self, term: str) -> bool:
         t_clean = str(term).strip()
         if not t_clean:
@@ -232,32 +253,31 @@ class SQLiteDatabase:
                 pass
             return False
 
+    @_synchronized
     def remove_term(self, term: str) -> bool:
+        """Remove o termo (sem diferenciar maiúsculas) e registra histórico
+        apenas se algo foi de fato removido."""
         t_clean = str(term).strip()
         if not t_clean:
             return False
         try:
             with self._conn:
-                self._conn.execute("BEGIN IMMEDIATE")
                 cur = self._conn.execute(
-                    "DELETE FROM terms WHERE term = ?",
+                    "DELETE FROM terms WHERE term = ? COLLATE NOCASE",
                     (t_clean,),
                 )
                 deleted = cur.rowcount > 0
-                self._conn.execute(
-                    "INSERT INTO term_history (term, action) VALUES (?, 'removed')",
-                    (t_clean,),
-                )
-                self._conn.commit()
+                if deleted:
+                    self._conn.execute(
+                        "INSERT INTO term_history (term, action) VALUES (?, 'removed')",
+                        (t_clean,),
+                    )
             return deleted
         except Exception as e:
             logger.error("remove_term failed: %s", e)
-            try:
-                self._conn.rollback()
-            except Exception:
-                pass
             return False
 
+    @_synchronized
     def get_term_history(self, limit: int = 50) -> List[Dict[str, Any]]:
         try:
             rows = self._conn.execute(
@@ -271,6 +291,7 @@ class SQLiteDatabase:
             return []
 
     # ----- Source Chats (Fase 3) -----
+    @_synchronized
     def list_source_chats(self) -> List[Dict[str, Any]]:
         """Retorna todas as entradas de source_chats."""
         try:
@@ -283,6 +304,7 @@ class SQLiteDatabase:
             logger.error("list_source_chats failed: %s", e)
             return []
 
+    @_synchronized
     def source_chats_mode(self) -> str:
         """Retorna 'allow' se houver qualquer entrada com mode='allow',
         senão 'deny' se só houver 'deny', senão 'all' (tabela vazia)."""
@@ -299,6 +321,7 @@ class SQLiteDatabase:
         except Exception:
             return "all"
 
+    @_synchronized
     def add_source_chat(self, chat_id: int, title: str = "", mode: str = "allow") -> bool:
         """Adiciona ou atualiza um chat na whitelist/blacklist."""
         if mode not in ("allow", "deny"):
@@ -316,6 +339,7 @@ class SQLiteDatabase:
             logger.error("add_source_chat failed: %s", e)
             return False
 
+    @_synchronized
     def remove_source_chat(self, chat_id: int) -> bool:
         """Remove um chat da whitelist/blacklist."""
         try:
@@ -329,6 +353,7 @@ class SQLiteDatabase:
             logger.error("remove_source_chat failed: %s", e)
             return False
 
+    @_synchronized
     def clear_source_chats(self) -> int:
         """Limpa a tabela. Retorna quantas linhas foram removidas."""
         try:
@@ -339,6 +364,7 @@ class SQLiteDatabase:
             logger.error("clear_source_chats failed: %s", e)
             return 0
 
+    @_synchronized
     def is_chat_allowed(self, chat_id: int) -> bool:
         """Decide se um chat deve ser monitorado, respeitando o mode atual."""
         mode = self.source_chats_mode()
@@ -358,6 +384,7 @@ class SQLiteDatabase:
             return True
 
     # ----- Deduplicação (Fase 4) -----
+    @_synchronized
     def was_hash_seen(self, h: str, window_seconds: int = 1800) -> bool:
         """Retorna True se o hash foi visto nos últimos N segundos."""
         try:
@@ -372,7 +399,8 @@ class SQLiteDatabase:
                 dt = datetime.datetime.fromisoformat(
                     str(last_seen).replace("Z", "+00:00")
                 )
-                delta = (datetime.datetime.utcnow() - dt.replace(tzinfo=None)).total_seconds()
+                now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+                delta = (now_utc - dt.replace(tzinfo=None)).total_seconds()
                 return delta < window_seconds
             except Exception:
                 return False
@@ -380,6 +408,7 @@ class SQLiteDatabase:
             logger.error("was_hash_seen failed: %s", e)
             return False
 
+    @_synchronized
     def remember_hash(self, h: str, term: str = "") -> None:
         """Grava (ou atualiza) o hash na tabela seen_hashes."""
         try:
@@ -394,20 +423,32 @@ class SQLiteDatabase:
         except Exception as e:
             logger.error("remember_hash failed: %s", e)
 
+    @_synchronized
     def purge_seen_hashes(self, older_than_seconds: int = 86400) -> int:
         """Remove hashes mais antigos que N segundos. Retorna contagem."""
         try:
             with self._conn:
                 cur = self._conn.execute(
-                    f"DELETE FROM seen_hashes WHERE "
-                    f"last_seen < datetime(CURRENT_TIMESTAMP, '-{int(older_than_seconds)} seconds')"
+                    "DELETE FROM seen_hashes WHERE "
+                    "last_seen < datetime(CURRENT_TIMESTAMP, ?)",
+                    (f"-{int(older_than_seconds)} seconds",),
                 )
                 return cur.rowcount
         except Exception as e:
             logger.error("purge_seen_hashes failed: %s", e)
             return 0
 
+    @_synchronized
+    def count_seen_hashes(self) -> int:
+        try:
+            row = self._conn.execute("SELECT COUNT(*) AS c FROM seen_hashes").fetchone()
+            return int(row["c"]) if row else 0
+        except Exception as e:
+            logger.error("count_seen_hashes failed: %s", e)
+            return 0
+
     # ----- Push Queue Support -----
+    @_synchronized
     def enqueue_push(self, html: str) -> int:
         try:
             with self._conn:
@@ -424,6 +465,7 @@ class SQLiteDatabase:
             logger.error("enqueue_push failed: %s", e)
             raise
 
+    @_synchronized
     def push_queue_count(self) -> int:
         try:
             row = self._conn.execute("SELECT COUNT(*) AS c FROM push_queue").fetchone()
@@ -431,6 +473,7 @@ class SQLiteDatabase:
         except Exception:
             return 0
 
+    @_synchronized
     def pop_due_pushes(self, limit: int = 100) -> List[Dict[str, Any]]:
         try:
             rows = self._conn.execute(
@@ -454,6 +497,7 @@ class SQLiteDatabase:
             logger.error("pop_due_pushes failed: %s", e)
             return []
 
+    @_synchronized
     def mark_push_success(self, push_id: int) -> None:
         try:
             with self._conn:
@@ -461,6 +505,7 @@ class SQLiteDatabase:
         except Exception as e:
             logger.error("mark_push_success failed: %s", e)
 
+    @_synchronized
     def mark_push_failure(self, push_id: int, error: str, backoff_seconds: int, max_retries: int = 20) -> bool:
         try:
             with self._conn:
@@ -475,10 +520,10 @@ class SQLiteDatabase:
                     logger.warning("Dropped push id=%d after %d retries. Last error: %s", push_id, rc, error)
                     return False
                 self._conn.execute(
-                    f"UPDATE push_queue SET retry_count=?, last_error=?, "
-                    f"next_attempt_at = datetime(CURRENT_TIMESTAMP, '+{int(backoff_seconds)} seconds') "
-                    f"WHERE id=?",
-                    (rc, str(error)[:500], push_id),
+                    "UPDATE push_queue SET retry_count=?, last_error=?, "
+                    "next_attempt_at = datetime(CURRENT_TIMESTAMP, ?) "
+                    "WHERE id=?",
+                    (rc, str(error)[:500], f"+{int(backoff_seconds)} seconds", push_id),
                 )
                 return True
         except Exception as e:
@@ -486,7 +531,8 @@ class SQLiteDatabase:
             return False
 
     # ----- Health -----
-    def health(self) -> Dict[str, Any]:
+    @_synchronized
+    def health(self, full: bool = True) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "connected": False,
             "db_file": self.db_path,
@@ -501,7 +547,8 @@ class SQLiteDatabase:
             except Exception:
                 pass
         try:
-            row = self._conn.execute("PRAGMA integrity_check").fetchone()
+            pragma = "integrity_check" if full else "quick_check"
+            row = self._conn.execute(f"PRAGMA {pragma}").fetchone()
             result["integrity_check"] = str(row[0]) if row else "no-row"
         except Exception as e:
             result["integrity_check"] = f"error: {e}"
@@ -516,6 +563,7 @@ class SQLiteDatabase:
         )
         return result
 
+    @_synchronized
     def terms_count(self) -> int:
         try:
             row = self._conn.execute("SELECT COUNT(*) AS c FROM terms").fetchone()
@@ -524,7 +572,9 @@ class SQLiteDatabase:
             return 0
 
     # ----- Backup / Restore -----
-    def backup(self, dest_path: str, verify: bool = True, compress: bool = False) -> str:
+    @_synchronized
+    def backup(self, dest_path: str, verify: bool = True, compress: bool = False,
+               _attempt: int = 1) -> str:
         dest_abs = _coerce_path(dest_path)
         if compress and not dest_abs.endswith(".gz"):
             dest_abs = dest_abs + ".gz"
@@ -566,7 +616,12 @@ class SQLiteDatabase:
                         os.remove(actual_final)
                 except Exception:
                     pass
-                return self.backup(dest_path, verify=True, compress=compress)
+                if _attempt >= 3:
+                    raise RuntimeError(
+                        f"Backup falhou na verificação após {_attempt} tentativas"
+                    )
+                return self.backup(dest_path, verify=True, compress=compress,
+                                   _attempt=_attempt + 1)
         return actual_final
 
     @staticmethod
@@ -640,6 +695,23 @@ class SQLiteDatabase:
                 except Exception:
                     pass
         return safety_path or ""
+
+
+    @_synchronized
+    def restore(self, backup_path: str, safety_copy: bool = True) -> str:
+        """Restaura este banco a partir de um backup, com a conexão
+        fechada durante a troca de arquivo e reaberta depois.
+        (restore_from_backup é classmethod e exige dest_db_path; esta é a
+        forma segura de usar a partir de uma instância em execução.)"""
+        self.close()
+        try:
+            safety = type(self).restore_from_backup(
+                backup_path, self.db_path, safety_copy=safety_copy
+            )
+        finally:
+            self._connect()
+        self.ensure_schema(backup_before_migration=False)
+        return safety
 
 
 # -----------------------------------------------------------------------------
@@ -761,3 +833,7 @@ def remember_hash(h: str, term: str = "") -> None:
 
 def purge_seen_hashes(older_than_seconds: int = 86400) -> int:
     return get_db().purge_seen_hashes(older_than_seconds)
+
+
+def count_seen_hashes() -> int:
+    return get_db().count_seen_hashes()

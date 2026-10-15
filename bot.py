@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import html
 import logging
+import os
 import re
 import time
 
@@ -11,14 +12,14 @@ from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import User, Chat, Channel
 
-from config import API_ID, API_HASH, SESSION, PHONE_NUMBER
+from config import API_ID, API_HASH, SESSION
 from utils import normalize, contains_term, extract_price, extract_product_name
-from matcher import smart_match, format_debug
+from matcher import smart_match, format_debug, tokenize
 from db import (
     save_terms, load_terms, add_term, remove_term, get_term_history, get_db,
     list_source_chats, source_chats_mode, add_source_chat, remove_source_chat,
     clear_source_chats, is_chat_allowed,
-    was_hash_seen, remember_hash, purge_seen_hashes,
+    was_hash_seen, remember_hash, purge_seen_hashes, count_seen_hashes,
 )
 from push_queue import enqueue_push_html
 
@@ -32,7 +33,8 @@ TERMOS_RELOAD_INTERVAL = 30
 DEBOUNCE_PER_TERM = 60
 MAX_TEXT_PREVIEW = 400
 CACHE_TTL = 30 * 60
-DEBUG = True
+# Verbose por padrão desligado (loga cada mensagem). Ligue com DEBUG=1 ou /debug on.
+DEBUG = os.getenv("DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
 
 IGNORE_ALL_BOTS = True
 ONLY_GROUPS = True
@@ -54,7 +56,8 @@ WATCHDOG_FAIL_THRESHOLD = 3
 # ============================================================
 # ESTADO GLOBAL
 # ============================================================
-mensagens_processadas = {}
+_hashes_em_envio: set = set()   # hashes sendo notificados agora (evita corrida)
+_startup_push_sent = False
 _me_id = None
 _me_username = None
 _ultimo_reload = 0.0
@@ -81,6 +84,12 @@ if not TERMOS:
     save_terms(TERMOS)
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+
+
+async def _db(fn, *args):
+    """Executa chamada síncrona de banco fora do event loop.
+    Com busy_timeout=30s, uma trava no SQLite não pode congelar o Telethon."""
+    return await asyncio.to_thread(fn, *args)
 
 
 # ============================================================
@@ -167,7 +176,7 @@ async def _reload_termos_se_preciso():
     if agora - _ultimo_reload < TERMOS_RELOAD_INTERVAL:
         return
     try:
-        novos = load_terms()
+        novos = await _db(load_terms)
         if novos != TERMOS:
             logger.info("[TERMOS] Atualizados: %s", novos)
             TERMOS = novos
@@ -182,8 +191,8 @@ async def _reload_source_chats_se_preciso():
     if agora - _source_last_reload < SOURCE_CHATS_RELOAD_INTERVAL:
         return
     try:
-        entradas = list_source_chats()
-        mode = source_chats_mode()
+        entradas = await _db(list_source_chats)
+        mode = await _db(source_chats_mode)
         allow = {int(e["chat_id"]) for e in entradas if e.get("mode") == "allow"}
         deny = {int(e["chat_id"]) for e in entradas if e.get("mode") == "deny"}
         if (mode != _source_mode) or (allow != _source_allow_ids) or (deny != _source_deny_ids):
@@ -278,21 +287,8 @@ async def _watchdog_loop():
                 _watchdog_fails, WATCHDOG_FAIL_THRESHOLD,
             )
             if _watchdog_fails >= WATCHDOG_FAIL_THRESHOLD:
-                logger.error("[WATCHDOG] threshold atingido — tentando reconectar...")
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                try:
-                    await client.connect()
-                    if client.is_connected():
-                        logger.info("[WATCHDOG] reconectado com sucesso")
-                        _watchdog_fails = 0
-                    else:
-                        raise RuntimeError("client.connect() retornou sem conexão")
-                except Exception as e:
-                    logger.error("[WATCHDOG] falha ao reconectar: %s", e)
-                    raise RuntimeError("watchdog: não foi possível reconectar") from e
+                logger.error("[WATCHDOG] threshold atingido — solicitando restart do bot")
+                raise RuntimeError("watchdog: cliente desconectado")
         except asyncio.CancelledError:
             logger.info("[WATCHDOG] cancelado")
             raise
@@ -326,6 +322,7 @@ async def process_message(event):
     if _is_command(raw_text):
         return
 
+    chat = None
     if ONLY_GROUPS:
         chat = await event.get_chat()
         if isinstance(chat, User):
@@ -347,12 +344,6 @@ async def process_message(event):
             logger.info("[SOURCE] chat %s ignorado (mode=%s)", event.chat_id, _source_mode)
         return
 
-    now = time.time()
-    mensagens_processadas[event.id] = now
-    for msg_id, ts in list(mensagens_processadas.items()):
-        if now - ts > CACHE_TTL:
-            mensagens_processadas.pop(msg_id, None)
-
     msg_original = raw_text.strip()
     if not msg_original:
         return
@@ -360,13 +351,16 @@ async def process_message(event):
     await _reload_termos_se_preciso()
     await _talvez_purgar_hashes()
 
-    chat = await event.get_chat()
+    chat = chat or await event.get_chat()
     chat_title_raw = getattr(chat, "title", None) or "Chat Privado"
     chat_title = html.escape(str(chat_title_raw))
     msg_limpa = normalize(msg_original)
 
     if DEBUG:
         logger.info("[CHECK] TERMOS=%s | msg=%r", TERMOS, msg_limpa[:100])
+
+    msg_tokens = tokenize(msg_limpa)   # uma vez por mensagem, não por termo
+    h = None                           # hash calculado sob demanda
 
     for termo in TERMOS:
         # 1) tentativa exata — comportamento original preservado
@@ -375,7 +369,9 @@ async def process_message(event):
 
         # 2) smart matching só entra se o exato falhou
         if not exact_match:
-            smart_result = smart_match(msg_limpa, termo, debug=DEBUG)
+            smart_result = smart_match(
+                msg_limpa, termo, debug=DEBUG, msg_tokens=msg_tokens
+            )
             if not smart_result["matched"]:
                 if DEBUG:
                     logger.info(
@@ -387,54 +383,69 @@ async def process_message(event):
         if not _deve_notificar(termo):
             continue
 
-        h = _compute_offer_hash(msg_original)
-        if h and was_hash_seen(h, DEDUP_WINDOW_SECONDS):
-            logger.info("[DEDUP] conteúdo repetido (hash=%s, termo=%s). Ignorado.", h, termo)
-            break
+        if h is None:
+            h = _compute_offer_hash(msg_original)
+
+        # Reserva o hash ANTES de qualquer await: a mesma oferta postada em
+        # dois grupos ao mesmo tempo gera dois handlers concorrentes, e sem
+        # isso ambos passariam pelo was_hash_seen e notificariam em dobro.
+        if h:
+            if h in _hashes_em_envio:
+                logger.info("[DEDUP] oferta em envio por outro handler (hash=%s). Ignorado.", h)
+                break
+            _hashes_em_envio.add(h)
 
         try:
-            msg_link = event.message.get_url() or "Link indisponível"
-        except Exception:
-            msg_link = "Link indisponível"
+            if h and await _db(was_hash_seen, h, DEDUP_WINDOW_SECONDS):
+                logger.info("[DEDUP] conteúdo repetido (hash=%s, termo=%s). Ignorado.", h, termo)
+                break
 
-        preco = extract_price(msg_original) or "Não identificado"
-        produto = html.escape(str(extract_product_name(msg_original)))
-        preview = html.escape(msg_original[:MAX_TEXT_PREVIEW])
-        termo_esc = html.escape(str(termo))
+            try:
+                msg_link = event.message.get_url() or "Link indisponível"
+            except Exception:
+                msg_link = "Link indisponível"
 
-        alerta_html = (
-            "<b>🔥 Oferta encontrada!</b>\n\n"
-            f"<b>🧩 Termo:</b> <code>{termo_esc}</code>\n"
-            f"<b>💬 Grupo:</b> {chat_title}\n"
-            f"<b>💰 Preço:</b> {preco}\n"
-            f"<b>📦 Produto:</b> {produto}\n"
-            f"<b>🔗 Link:</b> {msg_link}\n\n"
-            "<b>📝</b>\n"
-            f"{preview}"
-        )
+            preco = html.escape(str(extract_price(msg_original) or "Não identificado"))
+            produto = html.escape(str(extract_product_name(msg_original)))
+            preview = html.escape(msg_original[:MAX_TEXT_PREVIEW])
+            termo_esc = html.escape(str(termo))
+            link_esc = html.escape(str(msg_link), quote=False)
 
-        if exact_match:
-            logger.info("[MATCH] '%s' em '%s'", termo, chat_title)
-        else:
-            logger.info(
-                "[SMART MATCH] termo='%s' score=%d resultado=MATCH tipo=%s",
-                termo, smart_result["score"], smart_result["match_type"],
+            alerta_html = (
+                "<b>🔥 Oferta encontrada!</b>\n\n"
+                f"<b>🧩 Termo:</b> <code>{termo_esc}</code>\n"
+                f"<b>💬 Grupo:</b> {chat_title}\n"
+                f"<b>💰 Preço:</b> {preco}\n"
+                f"<b>📦 Produto:</b> {produto}\n"
+                f"<b>🔗 Link:</b> {link_esc}\n\n"
+                "<b>📝</b>\n"
+                f"{preview}"
             )
-            if DEBUG:
-                logger.info("\n%s", format_debug(termo, msg_original, smart_result))
 
-        enviado = await _enviar_notificacao(alerta_html)
+            if exact_match:
+                logger.info("[MATCH] '%s' em '%s'", termo, chat_title)
+            else:
+                logger.info(
+                    "[SMART MATCH] termo='%s' score=%d resultado=MATCH tipo=%s",
+                    termo, smart_result["score"], smart_result["match_type"],
+                )
+                if DEBUG:
+                    logger.info("\n%s", format_debug(termo, msg_original, smart_result))
 
-        if enviado:
-            _ultimos_envios[termo] = time.time()
-            _podar_cache_debounce()
+            enviado = await _enviar_notificacao(alerta_html)
+
+            if enviado:
+                _ultimos_envios[termo] = time.time()
+                _podar_cache_debounce()
+                if h:
+                    try:
+                        await _db(remember_hash, h, termo)
+                    except Exception:
+                        logger.exception("[DEDUP] Erro ao gravar hash")
+                await send_notification_push(alerta_html)
+        finally:
             if h:
-                try:
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, lambda: remember_hash(h, termo))
-                except Exception:
-                    logger.exception("[DEDUP] Erro ao gravar hash")
-            await send_notification_push(alerta_html)
+                _hashes_em_envio.discard(h)
         break
 
 
@@ -442,7 +453,7 @@ async def process_message(event):
 # COMANDOS
 # ============================================================
 
-@client.on(events.NewMessage(pattern=r'^/start(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/start(?:@\w+)?\b', outgoing=True))
 async def start_handler(event):
     asyncio.create_task(_auto_delete(event))
     await _responder(
@@ -458,7 +469,7 @@ async def start_handler(event):
     )
 
 
-@client.on(events.NewMessage(pattern=r'^/ping(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/ping(?:@\w+)?\b', outgoing=True))
 async def ping_handler(event):
     asyncio.create_task(_auto_delete(event))
     conectado = client.is_connected()
@@ -471,7 +482,7 @@ async def ping_handler(event):
     )
 
 
-@client.on(events.NewMessage(pattern=r'^/termos(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/termos(?:@\w+)?\b', outgoing=True))
 async def list_termos_handler(event):
     asyncio.create_task(_auto_delete(event))
     termos = load_terms()
@@ -482,7 +493,7 @@ async def list_termos_handler(event):
     await _responder(event, f"<b>Termos ({len(termos)}):</b>\n{linhas}")
 
 
-@client.on(events.NewMessage(pattern=r'^/settermos(?:@\w+)?\s+(.+)'))
+@client.on(events.NewMessage(pattern=r'^/settermos(?:@\w+)?\s+(.+)', outgoing=True))
 async def set_termos_handler(event):
     asyncio.create_task(_auto_delete(event))
     try:
@@ -496,7 +507,7 @@ async def set_termos_handler(event):
         await _responder(event, f"❌ Erro: {html.escape(str(e))}")
 
 
-@client.on(events.NewMessage(pattern=r'^/addtermo(?:@\w+)?\s+(.+)'))
+@client.on(events.NewMessage(pattern=r'^/addtermo(?:@\w+)?\s+(.+)', outgoing=True))
 async def add_termo_handler(event):
     asyncio.create_task(_auto_delete(event))
     termo = event.pattern_match.group(1).strip()
@@ -513,7 +524,7 @@ async def add_termo_handler(event):
         await _responder(event, "❌ Erro ao adicionar.")
 
 
-@client.on(events.NewMessage(pattern=r'^/deltermo(?:@\w+)?\s+(.+)'))
+@client.on(events.NewMessage(pattern=r'^/deltermo(?:@\w+)?\s+(.+)', outgoing=True))
 async def del_termo_handler(event):
     asyncio.create_task(_auto_delete(event))
     termo = event.pattern_match.group(1).strip()
@@ -528,7 +539,7 @@ async def del_termo_handler(event):
         await _responder(event, f"❌ Termo '{html.escape(termo)}' não encontrado.")
 
 
-@client.on(events.NewMessage(pattern=r'^/delall(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/delall(?:@\w+)?\b', outgoing=True))
 async def delall_handler(event):
     asyncio.create_task(_auto_delete(event))
     global TERMOS
@@ -537,12 +548,12 @@ async def delall_handler(event):
     await _responder(event, "🗑️ Todos os termos removidos.")
 
 
-@client.on(events.NewMessage(pattern=r'^/status(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/status(?:@\w+)?\b', outgoing=True))
 async def status_handler(event):
     asyncio.create_task(_auto_delete(event))
     try:
         db = get_db()
-        h = db.health()
+        h = await _db(lambda: db.health(full=False))
         await _responder(
             event,
             "🩺 <b>Status</b>\n"
@@ -561,13 +572,11 @@ async def status_handler(event):
         await _responder(event, f"❌ Erro: {html.escape(str(e))}")
 
 
-@client.on(events.NewMessage(pattern=r'^/dedup(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/dedup(?:@\w+)?\b', outgoing=True))
 async def dedup_handler(event):
     asyncio.create_task(_auto_delete(event))
     try:
-        db = get_db()
-        row = db._conn.execute("SELECT COUNT(*) AS c FROM seen_hashes").fetchone()
-        total = int(row["c"]) if row else 0
+        total = await _db(count_seen_hashes)
         await _responder(
             event,
             "🔒 <b>Deduplicação</b>\n"
@@ -580,7 +589,7 @@ async def dedup_handler(event):
         await _responder(event, f"❌ Erro: {html.escape(str(e))}")
 
 
-@client.on(events.NewMessage(pattern=r'^/historico(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/historico(?:@\w+)?\b', outgoing=True))
 async def historico_handler(event):
     asyncio.create_task(_auto_delete(event))
     try:
@@ -600,7 +609,7 @@ async def historico_handler(event):
         await _responder(event, f"❌ Erro: {html.escape(str(e))}")
 
 
-@client.on(events.NewMessage(pattern=r'^/chatid(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/chatid(?:@\w+)?\b', outgoing=True))
 async def chatid_handler(event):
     asyncio.create_task(_auto_delete(event))
     chat = await event.get_chat()
@@ -620,7 +629,7 @@ async def chatid_handler(event):
     )
 
 
-@client.on(events.NewMessage(pattern=r'^/debug(?:\s+(on|off))?(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/debug(?:\s+(on|off))?(?:@\w+)?\b', outgoing=True))
 async def debug_handler(event):
     asyncio.create_task(_auto_delete(event))
     global DEBUG
@@ -638,7 +647,7 @@ async def debug_handler(event):
         await _responder(event, "Uso: /debug on|off")
 
 
-@client.on(events.NewMessage(pattern=r'^/listgroups(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/listgroups(?:@\w+)?\b', outgoing=True))
 async def listgroups_handler(event):
     asyncio.create_task(_auto_delete(event))
     try:
@@ -667,7 +676,7 @@ async def listgroups_handler(event):
         await _responder(event, f"❌ Erro: {html.escape(str(e))}")
 
 
-@client.on(events.NewMessage(pattern=r'^/chats(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/chats(?:@\w+)?\b', outgoing=True))
 async def chats_handler(event):
     asyncio.create_task(_auto_delete(event))
     try:
@@ -698,7 +707,7 @@ async def chats_handler(event):
         await _responder(event, f"❌ Erro: {html.escape(str(e))}")
 
 
-@client.on(events.NewMessage(pattern=r'^/allowchat\s+(-?\d+)(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/allowchat\s+(-?\d+)(?:@\w+)?\b', outgoing=True))
 async def allowchat_handler(event):
     asyncio.create_task(_auto_delete(event))
     try:
@@ -723,7 +732,7 @@ async def allowchat_handler(event):
         await _responder(event, f"❌ Erro: {html.escape(str(e))}")
 
 
-@client.on(events.NewMessage(pattern=r'^/denychat\s+(-?\d+)(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/denychat\s+(-?\d+)(?:@\w+)?\b', outgoing=True))
 async def denychat_handler(event):
     asyncio.create_task(_auto_delete(event))
     try:
@@ -748,7 +757,7 @@ async def denychat_handler(event):
         await _responder(event, f"❌ Erro: {html.escape(str(e))}")
 
 
-@client.on(events.NewMessage(pattern=r'^/clearchats(?:@\w+)?\b'))
+@client.on(events.NewMessage(pattern=r'^/clearchats(?:@\w+)?\b', outgoing=True))
 async def clearchats_handler(event):
     asyncio.create_task(_auto_delete(event))
     try:
@@ -767,16 +776,22 @@ async def clearchats_handler(event):
 # MAIN
 # ============================================================
 async def main():
-    global _me_id, _me_username
+    global _me_id, _me_username, _startup_push_sent
+    watchdog = None
+    run_task = None
     try:
         await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError(
+                "Sessão do Telegram não autorizada. Gere uma nova SESSION (gerar_sessao.py)."
+            )
         me = await client.get_me()
         _me_id = me.id
         _me_username = (getattr(me, "username", "") or "").lower() or None
 
         logger.info("=" * 60)
         logger.info("Logado: id=%s username=%s bot=%s", me.id, me.username, me.bot)
-        logger.info("TERMOS carregados: %s", TERMOS)
+        logger.info("TERMOS carregados: %d", len(TERMOS))
         logger.info("NOTIF_CHAT_ID: %s", NOTIF_CHAT_ID)
         logger.info("DEBUG: %s | ONLY_GROUPS: %s | IGNORE_ALL_BOTS: %s | ENFORCE_SOURCE_CHATS: %s",
                     DEBUG, ONLY_GROUPS, IGNORE_ALL_BOTS, ENFORCE_SOURCE_CHATS)
@@ -793,14 +808,37 @@ async def main():
         await _reload_source_chats_se_preciso()
         logger.info("[SOURCE] mode inicial=%s", _source_mode)
 
-        # Sobe o watchdog como task paralela
-        asyncio.create_task(_watchdog_loop(), name="watchdog")
+        # Watchdog como task acompanhada: se ele falhar, o erro chega aqui e o
+        # supervisor reinicia o bot (antes a exceção morria numa task órfã).
+        watchdog = asyncio.create_task(_watchdog_loop(), name="watchdog")
 
-        await send_notification_push("<b>Bot iniciado</b>")
-        await client.run_until_disconnected()
+        # Push de boot só na primeira vez do processo (sem spam a cada restart)
+        if not _startup_push_sent:
+            await send_notification_push("<b>Bot iniciado</b>")
+            _startup_push_sent = True
 
-    except Exception as e:
-        logger.error(f"Erro no main: {e}", exc_info=True)
+        run_task = asyncio.ensure_future(client.run_until_disconnected())
+        done, _ = await asyncio.wait({run_task, watchdog}, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            t.result()  # propaga a exceção do watchdog, se houver
+        logger.warning("[BOT] cliente desconectou; solicitando restart")
+
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Erro no main")
+        raise  # o supervisor aplica backoff e reinicia
+    finally:
+        tasks = [t for t in (watchdog, run_task) if t is not None]
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

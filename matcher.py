@@ -8,6 +8,7 @@ Reutiliza utils.normalize() quando disponível.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 from rapidfuzz import fuzz
@@ -36,6 +37,8 @@ MIN_SMART_MATCH_SCORE = 75    # limiar global (0-100)
 
 # Fuzzy só entra em palavras com tamanho mínimo
 FUZZY_MIN_WORD_LEN = 4
+# Singular/plural automático só para palavras com tamanho mínimo
+PLURAL_MIN_WORD_LEN = 4
 # Ratio mínimo do RapidFuzz para aceitar como match fuzzy
 FUZZY_THRESHOLD    = 88
 
@@ -56,10 +59,9 @@ STOPWORDS = {
     "um", "uma",
 }
 
-# ============================================================
-# CACHE DE TOKENIZAÇÃO DE TERMOS (performance)
-# ============================================================
-_TERM_TOKENS_CACHE: Dict[str, List[str]] = {}
+# Tokens = sequências de letras/dígitos (ignora pontuação e "_").
+# Evita que "camisa," ou "iphone-15" quebrem o match.
+_TOKEN_RE = re.compile(r"[^\W_]+")
 
 
 # ============================================================
@@ -73,20 +75,18 @@ def normalize_text(text: str) -> str:
 def tokenize(text: str) -> List[str]:
     """Quebra texto em tokens normalizados."""
     n = normalize_text(text)
-    return [t for t in re.split(r"\s+", n) if t]
+    return _TOKEN_RE.findall(n)
 
 
-def _get_term_tokens(term: str) -> List[str]:
-    cached = _TERM_TOKENS_CACHE.get(term)
-    if cached is None:
-        cached = tokenize(term)
-        _TERM_TOKENS_CACHE[term] = cached
-    return cached
+@lru_cache(maxsize=2048)
+def _get_term_tokens(term: str) -> Tuple[str, ...]:
+    """Cache limitado (LRU) da tokenização dos termos."""
+    return tuple(tokenize(term))
 
 
 def clear_term_cache() -> None:
     """Útil em testes / recarga de termos."""
-    _TERM_TOKENS_CACHE.clear()
+    _get_term_tokens.cache_clear()
 
 
 # ============================================================
@@ -96,7 +96,11 @@ def get_word_variations(word: str) -> set:
     word = (word or "").lower()
     if not word:
         return set()
-    return set(WORD_VARIATIONS.get(word, {word}))
+    variations = set(WORD_VARIATIONS.get(word, {word}))
+    # singular <-> plural (ex.: "tenis" <-> "tenises" é inofensivo; "fone" <-> "fones" é o alvo)
+    if len(word) >= PLURAL_MIN_WORD_LEN and not any(c.isdigit() for c in word):
+        variations.add(word[:-1] if word.endswith("s") else word + "s")
+    return variations
 
 
 # ============================================================
@@ -135,8 +139,9 @@ def _word_match(term_word: str, msg_tokens: List[str]) -> Tuple[float, str, Opti
             continue
         if len(tok) < FUZZY_MIN_WORD_LEN:
             continue
-        # evita comparar números com palavras
-        if tok.isdigit() or tw.isdigit():
+        # tokens com dígitos são modelos/capacidades (rtx4060 vs rtx4070,
+        # s23 vs s24): fuzzy aqui gera falso positivo, só exato vale.
+        if any(c.isdigit() for c in tok) or any(c.isdigit() for c in tw):
             continue
         ratio = fuzz.ratio(tw, tok)
         if ratio >= FUZZY_THRESHOLD and ratio > best_ratio:
@@ -154,9 +159,20 @@ def _word_match(term_word: str, msg_tokens: List[str]) -> Tuple[float, str, Opti
 # ============================================================
 # SMART MATCH
 # ============================================================
-def smart_match(message_text: str, term: str, debug: bool = False) -> dict:
+def smart_match(
+    message_text: str,
+    term: str,
+    debug: bool = False,
+    msg_tokens: Optional[List[str]] = None,
+) -> dict:
     """
     Compara um termo com a mensagem.
+
+    msg_tokens: tokens já calculados da mensagem (opcional). Quando o chamador
+    testa vários termos contra a mesma mensagem, passe tokenize(msg) uma vez
+    só para evitar re-tokenizar a cada termo.
+    `debug` é mantido por compatibilidade (use format_debug para o texto).
+
     Retorna dict:
         {
             "matched": bool,
@@ -166,7 +182,8 @@ def smart_match(message_text: str, term: str, debug: bool = False) -> dict:
         }
     """
     term_tokens = _get_term_tokens(term)
-    msg_tokens  = tokenize(message_text)
+    if msg_tokens is None:
+        msg_tokens = tokenize(message_text)
 
     if not term_tokens or not msg_tokens:
         return {"matched": False, "score": 0, "match_type": "no_match", "details": []}

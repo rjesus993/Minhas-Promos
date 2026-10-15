@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Main entry point for Minhas Promo: orchestrates bot, FastAPI server,
 push queue, and backup scheduler with graceful shutdown, crash restart,
-and bot-task supervision."""
+and supervision of long-running tasks."""
 
 import asyncio
 import logging
@@ -21,74 +21,55 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# SUPERVISOR DO BOT
+# SUPERVISOR GENÉRICO
 # ============================================================================
-async def supervised_bot_runner(
-    max_backoff: int = 300,
+async def supervised(
+    name: str,
+    factory,
     initial_backoff: int = 5,
+    max_backoff: int = 300,
 ) -> None:
     """
-    Roda bot.main() em loop. Sempre que cair (por erro OU por retorno
+    Executa factory() em loop. Sempre que ela cair (por erro OU por retorno
     silencioso), reinicia com backoff exponencial.
 
+    - name: rótulo usado nos logs
+    - factory: callable assíncrono (coroutine function ou lambda)
     - max_backoff: teto do backoff em segundos
     - initial_backoff: backoff inicial em segundos
     """
-    from bot import main as bot_main_coro
-
     backoff = initial_backoff
-    tentativa = 0
 
     while True:
-        tentativa += 1
-        logger.info(f"[SUPERVISOR] Iniciando bot (tentativa #{tentativa})...")
-        started_at = time.time()
+        started = time.time()
+        logger.info(f"[{name}] Iniciando (backoff atual={backoff}s)...")
 
         try:
-            await bot_main_coro()
-            # Se bot.main() retornar sem exceção, consideramos queda silenciosa
-            uptime = time.time() - started_at
+            await factory()
+            uptime = time.time() - started
             logger.warning(
-                f"[SUPERVISOR] bot.main() retornou sem exceção "
-                f"(uptime={uptime:.1f}s). Reiniciando..."
+                f"[{name}] retornou sem exceção (uptime={uptime:.1f}s); reiniciando..."
             )
         except asyncio.CancelledError:
-            logger.info("[SUPERVISOR] Cancelado. Encerrando supervisor.")
+            logger.info(f"[{name}] Cancelado. Encerrando supervisor.")
             raise
-        except Exception as e:
-            uptime = time.time() - started_at
-            logger.exception(
-                f"[SUPERVISOR] bot.main() crashou após {uptime:.1f}s: {e}"
-            )
+        except Exception:
+            uptime = time.time() - started
+            logger.exception(f"[{name}] crashou após {uptime:.1f}s")
 
         # Se ficou de pé por bastante tempo, reseta o backoff
-        if time.time() - started_at > 60:
+        if time.time() - started > 60:
             backoff = initial_backoff
-            logger.info("[SUPERVISOR] Uptime > 60s, backoff resetado.")
+            logger.info(f"[{name}] Uptime > 60s, backoff resetado.")
 
-        logger.info(f"[SUPERVISOR] Aguardando {backoff}s antes de reiniciar...")
+        logger.info(f"[{name}] Aguardando {backoff}s antes de reiniciar...")
         try:
             await asyncio.sleep(backoff)
         except asyncio.CancelledError:
-            logger.info("[SUPERVISOR] Cancelado durante sleep. Encerrando.")
+            logger.info(f"[{name}] Cancelado durante sleep. Encerrando.")
             raise
 
         backoff = min(backoff * 2, max_backoff)
-
-
-# ============================================================================
-# SIGNAL HANDLERS
-# ============================================================================
-def _register_signal_handlers() -> None:
-    def _handle_signal(signum: int, frame: Any) -> None:
-        logger.info(f'Received signal {signum}, initiating graceful shutdown...')
-        for task in asyncio.all_tasks():
-            if not task.done():
-                task.cancel()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, signal.SIG_DFL)
-        signal.signal(sig, lambda s, f: _handle_signal(s, f))
 
 
 # ============================================================================
@@ -125,16 +106,20 @@ async def _backup_scheduler(db, cfg) -> None:
 async def run_main() -> None:
     cfg = load_config()
     setup_logging()
-    logger = logging.getLogger(__name__)
     db = get_db()
     ensure_schema()
+
     integrity = db.health().get('integrity_check', '')
     if integrity != 'ok':
         if cfg.auto_restore_on_corruption:
             logger.info('Database integrity check failed. Attempting auto-restore...')
             try:
                 backup_dir = Path(cfg.backup_dir)
-                backups = sorted(backup_dir.rglob('*.db'), key=lambda p: p.stat().st_mtime, reverse=True)
+                backups = sorted(
+                    backup_dir.rglob('*.db'),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
                 if backups:
                     db.restore_from_backup(str(backups[0]), safety_copy=True)
                     logger.info('Database restored from backup.')
@@ -153,31 +138,62 @@ async def run_main() -> None:
         logger.warning(f'Failed to enqueue startup push: {e}')
 
     # ------------------------------------------------------------------
+    # Shutdown coordenado via asyncio.Event
+    # ------------------------------------------------------------------
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _request_stop(*_args: Any) -> None:
+        if not stop.is_set():
+            logger.info("Sinal de shutdown recebido. Solicitando encerramento...")
+            stop.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except NotImplementedError:  # Windows
+            signal.signal(sig, lambda *_a: loop.call_soon_threadsafe(_request_stop))
+
+    # ------------------------------------------------------------------
     # Tasks supervisionadas
     # ------------------------------------------------------------------
-    bot_task = asyncio.create_task(supervised_bot_runner(), name='bot')
-    server_task = asyncio.create_task(
-        start_server_async(
-            host=cfg.server_host,
-            port=cfg.server_port,
-            health_token=cfg.health_token,
+    from bot import main as bot_main_coro
+
+    tasks = [
+        asyncio.create_task(
+            supervised("bot", bot_main_coro),
+            name="bot",
         ),
-        name='server',
-    )
-    push_task = asyncio.create_task(
-        push_queue_loop_async(interval_s=60), name='push_queue'
-    )
-    backup_task = asyncio.create_task(_backup_scheduler(db, cfg), name='backup_scheduler')
+        asyncio.create_task(
+            supervised(
+                "server",
+                lambda: start_server_async(
+                    host=cfg.server_host,
+                    port=cfg.server_port,
+                    health_token=cfg.health_token,
+                ),
+            ),
+            name="server",
+        ),
+        asyncio.create_task(
+            supervised(
+                "push",
+                lambda: push_queue_loop_async(interval_s=60),
+            ),
+            name="push",
+        ),
+        asyncio.create_task(_backup_scheduler(db, cfg), name="backup"),
+    ]
 
-    results = await asyncio.gather(
-        bot_task, server_task, push_task, backup_task,
-        return_exceptions=True,
-    )
+    await stop.wait()
+    logger.info("Encerrando tarefas...")
 
-    for task, result in zip(
-        [bot_task, server_task, push_task, backup_task], results
-    ):
-        if isinstance(result, Exception):
+    for t in tasks:
+        t.cancel()
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for task, result in zip(tasks, results):
+        if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
             logger.error(
                 f'Task {task.get_name()} failed: {result}',
                 exc_info=result,
@@ -194,27 +210,9 @@ async def run_main() -> None:
 # ============================================================================
 # MAIN
 # ============================================================================
-async def main() -> None:
-    _register_signal_handlers()
+if __name__ == "__main__":
     try:
-        await run_main()
+        asyncio.run(run_main())
     except KeyboardInterrupt:
-        logger.info('Interrupted by user.')
-    except Exception:
-        logger.exception('Fatal error in main loop.')
-        raise
-
-
-if __name__ == '__main__':
-    while True:
-        try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            logger.info('Interrupted by user, exiting.')
-            break
-        except Exception as e:
-            logger.exception(f'Main loop crashed: {e}')
-            cfg = load_config()
-            delay = getattr(cfg, 'restart_delay_seconds', 30)
-            logger.info(f'Restarting in {delay} seconds...')
-            time.sleep(delay)
+        # Fallback caso o handler de sinal não tenha sido registrado a tempo
+        pass

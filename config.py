@@ -7,7 +7,6 @@ every tunable, and exposes a single frozen data object via load_config().
 
 import os
 import logging
-import warnings
 from typing import Optional, Any
 from dataclasses import dataclass, field, asdict
 from dotenv import load_dotenv
@@ -25,15 +24,15 @@ class AppConfig:
 
     # ---- Telegram (required at startup for userbot operation) ----
     api_id: int
-    api_hash: str
-    telegram_session: str
+    api_hash: str = field(repr=False)
+    telegram_session: str = field(repr=False)
     phone_number: str = ""
     termos_env: list[str] = field(default_factory=list)
 
     # ---- Dead config vars (reserved for future use) ----
     # BOT_TOKEN and DESTINO_ID were loaded by legacy code but never used.
     # Keep them loaded to avoid surprising users; log a warning if set.
-    bot_token: Optional[str] = None
+    bot_token: Optional[str] = field(default=None, repr=False)
     destino_id: Any = None
 
     # ---- Database ----
@@ -57,13 +56,15 @@ class AppConfig:
     push_max_retries: int = 20
     push_backoff_base_seconds: int = 60
     push_queue_enabled: bool = True
+    push_max_age_seconds: int = 21600          # descarta pushes mais velhos que 6h (0 = nunca)
+    push_token: Optional[str] = field(default=None, repr=False)  # enviado como Bearer, se definido
 
     # ---- HTTP Server ----
     server_host: str = "0.0.0.0"
     server_port: int = 7860
 
     # ---- Security ----
-    health_token: Optional[str] = None
+    health_token: Optional[str] = field(default=None, repr=False)
 
     # ---- Crash recovery ----
     restart_delay_seconds: int = 30
@@ -71,9 +72,16 @@ class AppConfig:
     # ---- Telegram bot notifications target ID / channel future use ----
     # (legacy, reserved)
 
-    def to_dict(self) -> dict:
-        """Safe dict copy for logging (caller should redact secrets)."""
-        return asdict(self)
+    _SECRET_FIELDS = ("api_hash", "telegram_session", "bot_token", "health_token", "push_token")
+
+    def to_dict(self, redact: bool = True) -> dict:
+        """Dict para logs. Segredos vêm mascarados por padrão."""
+        data = asdict(self)
+        if redact:
+            for key in self._SECRET_FIELDS:
+                if data.get(key):
+                    data[key] = "***"
+        return data
 
 
 def _abs(base_dir: str, path: str) -> str:
@@ -183,16 +191,26 @@ def load_config(force_reload: bool = False) -> AppConfig:
         "PUSH_BACKOFF_BASE", os.getenv("PUSH_BACKOFF_BASE"), 60
     )
     push_queue_enabled = _coerce_bool("PUSH_QUEUE_ENABLED", os.getenv("PUSH_QUEUE_ENABLED"), True)
+    push_max_age_seconds = _coerce_int(
+        "PUSH_MAX_AGE_SECONDS", os.getenv("PUSH_MAX_AGE_SECONDS"), 21600
+    )
+    pt = os.getenv("PUSH_TOKEN")
+    push_token = str(pt).strip() if pt and str(pt).strip() else None
 
     # ----- Server -----
     server_host = (os.getenv("SERVER_HOST") or "0.0.0.0").strip()
-    server_port = _coerce_int("SERVER_PORT", os.getenv("SERVER_PORT"), 7860)
+    server_port = _coerce_int("SERVER_PORT", os.getenv("SERVER_PORT") or os.getenv("PORT"), 7860)
     if not (1 <= server_port <= 65535):
         raise ValueError(f"SERVER_PORT deve estar entre 1 e 65535 (recebido: {server_port})")
 
     # ----- Security -----
     ht = os.getenv("HEALTH_TOKEN")
     health_token = str(ht).strip() if ht and str(ht).strip() else None
+    if not health_token:
+        logger.warning(
+            "HEALTH_TOKEN não definido: /health/* detalhados ficam desabilitados e "
+            "/health devolve só o status. Defina HEALTH_TOKEN para habilitar os detalhes."
+        )
 
     # ----- Crash recovery -----
     restart_delay_seconds = _coerce_int(
@@ -231,6 +249,8 @@ def load_config(force_reload: bool = False) -> AppConfig:
         push_max_retries=push_max_retries,
         push_backoff_base_seconds=push_backoff_base_seconds,
         push_queue_enabled=push_queue_enabled,
+        push_max_age_seconds=push_max_age_seconds,
+        push_token=push_token,
         server_host=server_host,
         server_port=server_port,
         health_token=health_token,

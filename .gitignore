@@ -34,3 +34,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+.venv*/
+*.bak
+*.txt.bak

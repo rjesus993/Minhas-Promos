@@ -20,8 +20,10 @@ log (deliveries are best-effort; we don't want the queue to grow unbounded).
 """
 
 import asyncio
+import datetime
 import logging
 import random
+import threading
 import time
 from typing import Optional, Tuple
 
@@ -34,8 +36,43 @@ logger = logging.getLogger(__name__)
 # import-time; lazy so tests can mock).
 _CONFIG_REF: Optional[AppConfig] = None
 
-# Track in-memory last drain timestamp for rate-limited logs.
-_LAST_DRAIN_SUCCESS_TS = 0.0
+# Estado de observabilidade (lido por server.py em /health/external).
+# Atualizado a cada tentativa real de envio, otimista ou da fila.
+_STATE_LOCK = threading.Lock()
+_LAST_PUSH_OK_TS: Optional[float] = None
+_LAST_PUSH_FAIL_TS: Optional[float] = None
+
+# Se o endpoint cair, não gastamos N x timeout tentando o lote inteiro:
+# após X falhas seguidas o resto do lote fica para o próximo ciclo.
+CONSECUTIVE_FAIL_LIMIT = 3
+
+
+def _record_push_state(ok: int = 0, failed: int = 0) -> None:
+    global _LAST_PUSH_OK_TS, _LAST_PUSH_FAIL_TS
+    now = time.time()
+    with _STATE_LOCK:
+        if ok:
+            _LAST_PUSH_OK_TS = now
+        if failed:
+            _LAST_PUSH_FAIL_TS = now
+
+
+def get_push_state() -> dict:
+    with _STATE_LOCK:
+        return {"last_success_ts": _LAST_PUSH_OK_TS, "last_failure_ts": _LAST_PUSH_FAIL_TS}
+
+
+def _row_age_seconds(created_at) -> Optional[float]:
+    """Idade da linha da fila (created_at é CURRENT_TIMESTAMP, em UTC)."""
+    if not created_at:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()
 
 
 def _ensure_config() -> AppConfig:
@@ -66,14 +103,23 @@ def _get_requests():
 def _do_push_sync(endpoint: str, html: str, timeout_s: int) -> None:
     """Fire the HTTP push synchronously. Raises on any error."""
     requests_lib = _get_requests()
-    resp = requests_lib.post(
-        endpoint,
-        json={"texto": html},
-        timeout=timeout_s,
-        headers={"Content-Type": "application/json"},
-    )
-    # 4xx/5xx become HTTPError
-    resp.raise_for_status()
+    headers = {"Content-Type": "application/json"}
+    token = getattr(_ensure_config(), "push_token", None)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        resp = requests_lib.post(
+            endpoint,
+            json={"texto": html},
+            timeout=timeout_s,
+            headers=headers,
+        )
+        # 4xx/5xx become HTTPError
+        resp.raise_for_status()
+    except Exception:
+        _record_push_state(failed=1)
+        raise
+    _record_push_state(ok=1)
 
 
 def enqueue_push_html(html: str, optimistic: bool = True) -> bool:
@@ -124,17 +170,36 @@ def process_due_queue_http_sync() -> Tuple[int, int]:
     if not rows:
         return 0, 0
 
+    max_age = int(getattr(cfg, "push_max_age_seconds", 0) or 0)
     success = 0
     failed = 0
+    consecutive_fail = 0
     for row in rows:
         row_id = int(row["id"])
         html = row["html"]
         retry_count = int(row.get("retry_count") or 0)
+
+        # Oferta velha demais não vale mais a notificação: descarta.
+        age = _row_age_seconds(row.get("created_at"))
+        if max_age and age is not None and age > max_age:
+            logger.info("Push #%d descartado por idade (%.0fs > %ds).", row_id, age, max_age)
+            db.mark_push_success(row_id)
+            continue
+
+        if consecutive_fail >= CONSECUTIVE_FAIL_LIMIT:
+            logger.warning(
+                "Push: %d falhas seguidas; adiando o restante do lote para o próximo ciclo.",
+                consecutive_fail,
+            )
+            break
+
         try:
             _do_push_sync(cfg.push_endpoint, html, cfg.push_timeout_seconds)
             db.mark_push_success(row_id)
             success += 1
+            consecutive_fail = 0
         except Exception as e:
+            consecutive_fail += 1
             err_str = str(e)[:255] if e else "unknown"
             # Dead letter after N retries (retry_count here is pre-send; failure
             # means attempt #retry_count+1).
@@ -157,17 +222,13 @@ def process_due_queue_http_sync() -> Tuple[int, int]:
                 db.mark_push_failure(row_id, err_str, backoff, max_retries)
             failed += 1
 
-    global _LAST_DRAIN_SUCCESS_TS
-    if success > 0 or failed > 0:
-        _LAST_DRAIN_SUCCESS_TS = time.time()
     logger.debug("Push queue drain: %d ok, %d failed.", success, failed)
     return success, failed
 
 
 async def process_due_queue_http() -> Tuple[int, int]:
     """Async wrapper that runs sync HTTP in executor to avoid blocking the loop."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, process_due_queue_http_sync)
+    return await asyncio.to_thread(process_due_queue_http_sync)
 
 
 async def push_queue_loop_async(interval_s: int = 60) -> None:
@@ -192,9 +253,4 @@ async def push_queue_loop_async(interval_s: int = 60) -> None:
         except Exception as e:
             # Never let the loop die; log and continue.
             logger.exception("push_queue_loop unexpected error: %s", e)
-        # Sleep in small slices so cancellation is responsive
-        slept = 0
-        step = min(5, int(interval_s))
-        while slept < interval_s:
-            await asyncio.sleep(step)
-            slept += step
+        await asyncio.sleep(interval_s)  # cancelável a qualquer momento

@@ -12,6 +12,9 @@ Usage for shutdown from outside this module:
 """
 
 import asyncio
+import contextlib
+import datetime
+import hmac
 import logging
 import os
 import shutil
@@ -24,7 +27,9 @@ from fastapi.responses import JSONResponse
 import uvicorn
 
 from db import get_db, reset_db_singleton
-from push_queue import process_due_queue_http_sync, _ensure_config as _pq_cfg
+from push_queue import (  # noqa: F401  (re-exports mantidos por compatibilidade)
+    process_due_queue_http_sync, _ensure_config as _pq_cfg, get_push_state, _record_push_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +45,23 @@ _LAST_PUSH_FAIL_TS: Optional[float] = None
 
 
 def _now_iso() -> str:
-    import datetime
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return (datetime.datetime.now(datetime.timezone.utc)
+            .replace(microsecond=0).isoformat().replace("+00:00", "Z"))
+
+
+def _started_at_iso() -> Optional[str]:
+    """Momento em que o servidor subiu (antes devolvia a hora ATUAL)."""
+    if not _SERVER_STARTED_AT:
+        return None
+    return (datetime.datetime.fromtimestamp(_SERVER_STARTED_AT, datetime.timezone.utc)
+            .replace(microsecond=0).isoformat().replace("+00:00", "Z"))
+
+
+def _ts_iso(ts: Optional[float]) -> Optional[str]:
+    if not ts:
+        return None
+    return (datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+            .replace(microsecond=0).isoformat().replace("+00:00", "Z"))
 
 
 def _uptime_seconds() -> float:
@@ -114,11 +134,21 @@ def build_app(health_token: Optional[str] = None) -> FastAPI:
         if not _HEALTH_TOKEN:
             return
         provided = request.headers.get("X-Health-Token") or request.query_params.get("token")
-        if not provided or provided != _HEALTH_TOKEN:
+        # comparação em tempo constante (evita timing attack no token)
+        if not provided or not hmac.compare_digest(str(provided), str(_HEALTH_TOKEN)):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Health endpoints require X-Health-Token header or ?token= query",
             )
+
+    # ---- Detalhes (host, caminhos, pid, plataforma) só com token configurado ----
+    def _require_detail(request: Request) -> None:
+        if not _HEALTH_TOKEN:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Defina HEALTH_TOKEN para habilitar os endpoints detalhados de health",
+            )
+        _require_health_token(request)
 
     # ---- / (uptime monitor keepalive; intentionally public) ----
     @app.get("/")
@@ -127,7 +157,7 @@ def build_app(health_token: Optional[str] = None) -> FastAPI:
             "status": "running",
             "message": "Userbot ativo",
             "uptime_s": round(_uptime_seconds(), 1),
-            "started_at": _now_iso() if _SERVER_STARTED_AT else None,
+            "started_at": _started_at_iso(),
         }
 
     @app.head("/")
@@ -145,11 +175,18 @@ def build_app(health_token: Optional[str] = None) -> FastAPI:
         overall_ok = all(
             p.get("ok") for p in (sub_db, sub_storage, sub_system, sub_external)
         )
+        if not _HEALTH_TOKEN:
+            # Sem token: não expõe hostname, caminhos, pid, endpoint etc.
+            return {
+                "status": "healthy" if overall_ok else "degraded",
+                "ok": overall_ok,
+                "uptime_s": round(_uptime_seconds(), 1),
+            }
         return {
             "status": "healthy" if overall_ok else "degraded",
             "ok": overall_ok,
             "uptime_s": round(_uptime_seconds(), 1),
-            "started_at": _now_iso() if _SERVER_STARTED_AT else None,
+            "started_at": _started_at_iso(),
             "server": {"host": _SERVER_CONFIG_HOST, "port": _SERVER_CONFIG_PORT},
             "database": sub_db,
             "storage": sub_storage,
@@ -163,23 +200,23 @@ def build_app(health_token: Optional[str] = None) -> FastAPI:
         return {}
 
     # ---- Sub health endpoints ----
-    @app.get("/health/database", dependencies=[Depends(_require_health_token)])
+    @app.get("/health/database", dependencies=[Depends(_require_detail)])
     def health_database():
         db = get_db()
         info = _health_database_payload(db)
         return JSONResponse(status_code=(200 if info["ok"] else 503), content=info)
 
-    @app.get("/health/storage", dependencies=[Depends(_require_health_token)])
+    @app.get("/health/storage", dependencies=[Depends(_require_detail)])
     def health_storage():
         info = _health_storage_payload()
         return JSONResponse(status_code=(200 if info["ok"] else 507), content=info)
 
-    @app.get("/health/system", dependencies=[Depends(_require_health_token)])
+    @app.get("/health/system", dependencies=[Depends(_require_detail)])
     def health_system():
         info = _health_system_payload()
         return JSONResponse(status_code=200, content=info)
 
-    @app.get("/health/external", dependencies=[Depends(_require_health_token)])
+    @app.get("/health/external", dependencies=[Depends(_require_detail)])
     def health_external():
         info = _health_external_payload()
         return JSONResponse(status_code=(200 if info["ok"] else 502), content=info)
@@ -189,7 +226,7 @@ def build_app(health_token: Optional[str] = None) -> FastAPI:
 
 def _health_database_payload(db) -> dict:
     try:
-        h = db.health()
+        h = db.health(full=False)  # quick_check: leve o bastante para monitor
     except Exception as e:
         return {
             "ok": False,
@@ -292,23 +329,33 @@ def _health_external_payload() -> dict:
     if pending and pending >= 50:
         ok = False
 
+    push_state = get_push_state()
     details = {
         "endpoint": endpoint,
         "queue_enabled": queue_enabled,
         "pending": pending,
-        "last_push_success_at": _LAST_PUSH_OK_TS,
-        "last_push_failure_at": _LAST_PUSH_FAIL_TS,
+        "last_push_success_at": _ts_iso(push_state.get("last_success_ts")),
+        "last_push_failure_at": _ts_iso(push_state.get("last_failure_ts")),
     }
     return {"ok": ok, **details}
 
 
 def _update_push_state_from_drain_results(ok: int, failed: int) -> None:
     """Called from main.py backup loop after each push drain cycle, for observability."""
-    global _LAST_PUSH_OK_TS, _LAST_PUSH_FAIL_TS
-    if ok:
-        _LAST_PUSH_OK_TS = time.time()
-    if failed:
-        _LAST_PUSH_FAIL_TS = time.time()
+    _record_push_state(ok=ok, failed=failed)
+
+
+class _NoSignalServer(uvicorn.Server):
+    """uvicorn não pode capturar SIGINT/SIGTERM: quem cuida do shutdown é o
+    main.py. Se capturasse, serve() retornaria "normalmente" no SIGTERM e o
+    supervisor reiniciaria o servidor durante o desligamento."""
+
+    def install_signal_handlers(self) -> None:          # uvicorn < 0.29
+        pass
+
+    @contextlib.contextmanager
+    def capture_signals(self):                          # uvicorn >= 0.29
+        yield
 
 
 async def start_server_async(host: str = "0.0.0.0", port: int = 7860, health_token: Optional[str] = None) -> None:
@@ -328,11 +375,11 @@ async def start_server_async(host: str = "0.0.0.0", port: int = 7860, health_tok
         host=host,
         port=int(port),
         log_level="info",
-        access_log=True,
+        access_log=False,  # token em ?token= não deve ir parar nos logs
         timeout_keep_alive=5,
         loop="asyncio",
     )
-    server = uvicorn.Server(config)
+    server = _NoSignalServer(config)
 
     logger.info("Starting FastAPI server on %s:%s ...", host, port)
     try:
